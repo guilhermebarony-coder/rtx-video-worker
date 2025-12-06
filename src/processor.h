@@ -266,6 +266,4 @@ private:
 
     FramePtr m_bgra{nullptr, &av_frame_free_single_fp};
     FramePtr m_out{nullptr, &av_frame_free_single_fp};
-
-    bool m_rtx_initialized = false;
 };

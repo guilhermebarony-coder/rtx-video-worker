@@ -99,6 +99,7 @@ struct AudioEncoderContext
     AVFilterContext *buffersink = nullptr; // Filter output
     int64_t accumulated_samples = 0;       // Sample counter for PTS calculation
     int64_t start_pts = AV_NOPTS_VALUE;    // First audio PTS for baseline
+    int64_t last_dts = AV_NOPTS_VALUE;     // DTS monotonicity tracking for this audio stream
 };
 
 // Stream mapping decision for each input stream

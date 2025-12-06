@@ -2,19 +2,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include <string>
-#include <vector>
 #include <memory>
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
-#include <ctime>
-#include <queue>
-#include <filesystem>
-#include <cctype>
 #include <cstring>
-#include <system_error>
-#include <cerrno>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -57,7 +50,6 @@ extern "C"
 #include "timestamp_manager.h"
 #include "processor.h"
 #include "logger.h"
-#include "audio_config.h"
 #include "async_demuxer.h"
 #include "ffmpeg_passthrough.h"
 #include "config_parser.h"
@@ -642,12 +634,6 @@ int run_pipeline(PipelineConfig cfg)
         // behavior for HLS fragmented streaming in dual-process deployments where RTXVideoProcessor
         // handles video and vanilla FFmpeg handles audio with different seek positions.
 
-        // NOTE: output_ts_offset is applied directly to AVFormatContext->output_ts_offset in
-        // write_muxer_header() to match vanilla FFmpeg behavior. The muxer (libavformat/mux.c)
-        // handles timestamp offsetting during av_interleaved_write_frame(), ensuring correct
-        // behavior for HLS fragmented streaming in dual-process deployments where RTXVideoProcessor
-        // handles video and vanilla FFmpeg handles audio with different seek positions.
-
         // Create timestamp manager (simplified)
         TimestampManager ts_manager(ts_config);
 
@@ -746,9 +732,10 @@ int run_pipeline(PipelineConfig cfg)
                     // The decoder then outputs all frames from that keyframe onwards.
                     // FFmpeg's default behavior (accurate_seek) is to decode but discard frames before the target.
                     // Respect user's -noaccurate_seek or -seek2any flags - don't discard if they disabled accurate seeking.
-                    if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && decframe->pts != AV_NOPTS_VALUE)
+                    int64_t frame_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
+                    if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && frame_pts != AV_NOPTS_VALUE)
                     {
-                        int64_t frame_time_us = av_rescale_q(decframe->pts, in.vst->time_base, {1, AV_TIME_BASE});
+                        int64_t frame_time_us = av_rescale_q(frame_pts, in.vst->time_base, {1, AV_TIME_BASE});
                         if (frame_time_us < in.seek_offset_us)
                         {
                             // Frame is before seek target - discard it (accurate seeking behavior)
@@ -758,10 +745,10 @@ int run_pipeline(PipelineConfig cfg)
                     }
 
                     // Duration limit: Stop processing when we've reached the requested duration
-                    if (duration_us > 0 && decframe->pts != AV_NOPTS_VALUE)
+                    if (duration_us > 0 && frame_pts != AV_NOPTS_VALUE)
                     {
-                        // Convert frame PTS to microseconds
-                        int64_t frame_time_us = av_rescale_q(decframe->pts, in.vst->time_base, {1, 1000000});
+                        // Convert frame PTS to microseconds (reuse frame_pts from above)
+                        int64_t frame_time_us = av_rescale_q(frame_pts, in.vst->time_base, {1, 1000000});
 
                         // Calculate elapsed time from start
                         // FFmpeg behavior: With output seeking (-ss after -i), duration is measured from
@@ -941,17 +928,7 @@ int run_pipeline(PipelineConfig cfg)
                         av_frame_unref(frame.get());
                         if (swframe)
                             av_frame_unref(swframe.get());
-                        continue;
                     }
-                    // COPYTS: Each stream preserves its own timeline independently
-                    // No shared baseline needed - tfdt is per-stream in fMP4
-
-                    if (use_cuda_path)
-                        rtx.syncStream();
-                    encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
-                    av_frame_unref(frame.get());
-                    if (swframe)
-                        av_frame_unref(swframe.get());
                 }
                 // Video packet fully processed, continue to next packet
                 continue;
@@ -990,9 +967,10 @@ int run_pipeline(PipelineConfig cfg)
                         AVStream *ast = in.fmt->streams[audio_stream_idx];
 
                         // Accurate seeking: Discard audio frames before seek target (only if accurate seek enabled)
-                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && audio_frame->pts != AV_NOPTS_VALUE)
+                        int64_t audio_pts = (audio_frame->pts != AV_NOPTS_VALUE) ? audio_frame->pts : audio_frame->best_effort_timestamp;
+                        if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && audio_pts != AV_NOPTS_VALUE)
                         {
-                            int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
+                            int64_t frame_time_us = av_rescale_q(audio_pts, ast->time_base, {1, AV_TIME_BASE});
                             if (frame_time_us < in.seek_offset_us)
                             {
                                 // Audio frame is before seek target - discard it
@@ -1004,9 +982,9 @@ int run_pipeline(PipelineConfig cfg)
                         // Output seeking: Discard audio frames before output seek target
                         // This ensures audio and video segments have the same content range for proper A/V sync
                         // Like video's TimestampManager, stop checking after first valid frame passes
-                        if (!out.audio_output_seek_complete && ts_config.output_seek_target_us > 0 && audio_frame->pts != AV_NOPTS_VALUE)
+                        if (!out.audio_output_seek_complete && ts_config.output_seek_target_us > 0 && audio_pts != AV_NOPTS_VALUE)
                         {
-                            int64_t frame_time_us = av_rescale_q(audio_frame->pts, ast->time_base, {1, AV_TIME_BASE});
+                            int64_t frame_time_us = av_rescale_q(audio_pts, ast->time_base, {1, AV_TIME_BASE});
                             if (frame_time_us < ts_config.output_seek_target_us)
                             {
                                 // Audio frame is before output seek target - discard it
@@ -1186,6 +1164,20 @@ int run_pipeline(PipelineConfig cfg)
 
                             opkt->stream_index = enc_ctx.output_stream->index;
                             av_packet_rescale_ts(opkt.get(), enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
+
+                            // DTS monotonicity fix for audio flush packets
+                            if (enc_ctx.last_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
+                            {
+                                int64_t min_dts = enc_ctx.last_dts + 1;
+                                if (opkt->dts < min_dts)
+                                {
+                                    opkt->dts = min_dts;
+                                    if (opkt->pts != AV_NOPTS_VALUE && opkt->pts < opkt->dts)
+                                        opkt->pts = opkt->dts;
+                                }
+                            }
+                            enc_ctx.last_dts = opkt->dts;
+
                             av_interleaved_write_frame(out.fmt, opkt.get());
                             av_packet_unref(opkt.get());
                         }
@@ -1203,6 +1195,20 @@ int run_pipeline(PipelineConfig cfg)
 
                         opkt->stream_index = enc_ctx.output_stream->index;
                         av_packet_rescale_ts(opkt.get(), enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
+
+                        // DTS monotonicity fix for audio flush packets
+                        if (enc_ctx.last_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
+                        {
+                            int64_t min_dts = enc_ctx.last_dts + 1;
+                            if (opkt->dts < min_dts)
+                            {
+                                opkt->dts = min_dts;
+                                if (opkt->pts != AV_NOPTS_VALUE && opkt->pts < opkt->dts)
+                                    opkt->pts = opkt->dts;
+                            }
+                        }
+                        enc_ctx.last_dts = opkt->dts;
+
                         av_interleaved_write_frame(out.fmt, opkt.get());
                         av_packet_unref(opkt.get());
                     }
@@ -1295,5 +1301,5 @@ int main(int argc, char **argv)
 
     // FFmpeg log level is now set dynamically in run_pipeline() based on cfg.verbose/debug
 
-    int ret = run_pipeline(cfg);
+    return run_pipeline(cfg);
 }

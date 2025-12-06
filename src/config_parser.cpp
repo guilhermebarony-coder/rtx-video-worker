@@ -570,20 +570,25 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->outputTsOffset = argv[++i];
         }
-        else if (arg == "-vsync")
+        else if (arg == "-vsync" || arg == "-fps_mode")
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "-vsync requires a value\n");
-                fprintf(stderr, "Supported modes: cfr (constant frame rate)\n");
+                fprintf(stderr, "%s requires a value\n", arg.c_str());
+                fprintf(stderr, "Supported modes: cfr (constant frame rate), passthrough/vfr (variable frame rate)\n");
                 exit(1);
             }
             cfg->vsync = argv[++i];
             // Validate supported modes
-            if (cfg->vsync != "cfr" && cfg->vsync != "0")
+            // FFmpeg equivalents: cfr=0, vfr=1, passthrough=2, auto=-1
+            if (cfg->vsync == "passthrough" || cfg->vsync == "vfr" || cfg->vsync == "1" || cfg->vsync == "2")
             {
-                fprintf(stderr, "Unsupported -vsync mode: %s\n", cfg->vsync.c_str());
-                fprintf(stderr, "Only 'cfr' is currently supported\n");
+                cfg->vsync = ""; // Empty = VFR passthrough (default behavior)
+            }
+            else if (cfg->vsync != "cfr" && cfg->vsync != "0")
+            {
+                fprintf(stderr, "Unsupported %s mode: %s\n", arg.c_str(), cfg->vsync.c_str());
+                fprintf(stderr, "Supported: cfr (or 0), passthrough/vfr (or 1/2)\n");
                 exit(1);
             }
         }

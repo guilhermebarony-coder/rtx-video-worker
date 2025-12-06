@@ -388,7 +388,10 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                         false, // bt2020 = false for SDR
                         m_stream);
 
-    // Free temporary buffers
+    // Synchronize before freeing temp buffers to ensure kernels have finished reading from them
+    cudaStreamSynchronize(m_stream);
+
+    // Free temporary buffers (safe now that kernels are complete)
     cudaFree(d_tempY);
     cudaFree(d_tempUV);
 
@@ -477,6 +480,10 @@ bool RTXProcessor::processGpuP010SDRToP010(const uint8_t *d_y, int pitchY,
                         (int)m_srcW, (int)m_srcH,
                         m_stream);
 
+    // Synchronize after p010_to_nv12 kernel before passing temp buffers to next function
+    // This ensures the temp buffers contain valid data before processGpuNV12ToP010 reads them
+    cudaStreamSynchronize(m_stream);
+
     // Step 2: NV12 → BGRA8 → RTX (VSR+THDR) → ABGR10 → P010
     // Reuse the NV12ToP010 logic by calling it with the temp NV12 buffers
     bool result = processGpuNV12ToP010(d_tempY, (int)tempPitchY,
@@ -484,7 +491,7 @@ bool RTXProcessor::processGpuP010SDRToP010(const uint8_t *d_y, int pitchY,
                                        encP010Frame,
                                        false); // bt2020=false for SDR input
 
-    // Free temporary buffers
+    // Note: processGpuNV12ToP010 already synchronizes at the end, so temp buffers are safe to free
     cudaFree(d_tempY);
     cudaFree(d_tempUV);
 

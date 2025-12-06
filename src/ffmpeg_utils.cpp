@@ -1712,6 +1712,25 @@ bool process_audio_frame_multi(AVFrame *input_frame, int input_stream_index, Out
             // Note: FFmpeg automatically sets dts=pts for audio in avcodec_receive_packet()
             av_packet_rescale_ts(output_packet, enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
 
+            // DTS monotonicity fix for audio (mirrors video fix in encode_and_write)
+            // MP4 muxer requires strictly increasing DTS values
+            if (enc_ctx.last_dts != AV_NOPTS_VALUE && output_packet->dts != AV_NOPTS_VALUE)
+            {
+                int64_t min_dts = enc_ctx.last_dts + 1;
+                if (output_packet->dts < min_dts)
+                {
+                    LOG_DEBUG("Audio DTS monotonicity (stream %d): adjusting DTS from %lld to %lld",
+                              input_stream_index, output_packet->dts, min_dts);
+                    output_packet->dts = min_dts;
+                    // Ensure PTS >= DTS after adjustment
+                    if (output_packet->pts != AV_NOPTS_VALUE && output_packet->pts < output_packet->dts)
+                    {
+                        output_packet->pts = output_packet->dts;
+                    }
+                }
+            }
+            enc_ctx.last_dts = output_packet->dts;
+
             // Write packet to muxer
             ret = av_interleaved_write_frame(out.fmt, output_packet);
             av_packet_free(&output_packet);
