@@ -148,7 +148,8 @@ public:
             const int *coeffs = (decframe->colorspace == AVCOL_SPC_BT2020_NCL)
                                     ? sws_getCoefficients(SWS_CS_BT2020)
                                     : sws_getCoefficients(SWS_CS_ITU709);
-            sws_setColorspaceDetails(m_sws_to_argb, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
+            int srcRange = (decframe->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+            sws_setColorspaceDetails(m_sws_to_argb, coeffs, srcRange, coeffs, 1, 0, 1 << 16, 1 << 16);
             m_last_src_format = decframe->format;
             m_last_src_w = decframe->width;
             m_last_src_h = decframe->height;
@@ -182,9 +183,10 @@ public:
                 return false;
             const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
                                                      : sws_getCoefficients(SWS_CS_ITU709);
+            // Source is RGB(A) from RTX (full-range); destination YUV should be limited-range
             sws_setColorspaceDetails(m_sws_to_yuv,
-                                     coeffs, m_rtx_cfg.enableTHDR ? 1 : 0,
-                                     coeffs, m_rtx_cfg.enableTHDR ? 0 : 0,
+                                     coeffs, 1,
+                                     coeffs, 0,
                                      0, 1 << 16, 1 << 16);
         }
 
@@ -230,9 +232,10 @@ public:
             throw std::runtime_error("CpuProcessor: sws_to_yuv alloc failed in setConfig");
         const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
                                                  : sws_getCoefficients(SWS_CS_ITU709);
+        // Source is RGB(A) from RTX (full-range); destination YUV should be limited-range
         sws_setColorspaceDetails(m_sws_to_yuv,
-                                 coeffs, m_rtx_cfg.enableTHDR ? 1 : 0,
-                                 coeffs, m_rtx_cfg.enableTHDR ? 0 : 0,
+                                 coeffs, 1,
+                                 coeffs, 0,
                                  0, 1 << 16, 1 << 16);
     }
 

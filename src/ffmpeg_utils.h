@@ -34,7 +34,16 @@ inline std::string ff_ts(double seconds)
 }
 
 // Attach HDR mastering metadata and content light level side data to a video stream
+// Used for SDR→HDR (THDR) to generate synthetic metadata
 void add_mastering_and_cll(AVStream *st, int max_luminance_nits);
+
+// Read and preserve HDR metadata from input stream to output stream
+// Used for HDR→HDR passthrough to maintain original mastering display characteristics
+bool copy_stream_hdr_metadata(const AVStream *input_stream, AVStream *output_stream);
+
+// Copy per-frame HDR side data (supports HDR10+, Dolby Vision, etc.)
+// Call after frame processing to preserve dynamic metadata
+void copy_frame_hdr_side_data(const AVFrame *src_frame, AVFrame *dst_frame);
 
 // Open input and locate video stream, prepare decoder. Tries to enable CUDA device.
 bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *options = nullptr);

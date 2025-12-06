@@ -430,11 +430,22 @@ void configure_stream_metadata(InputContext &in, OutputContext &out, PipelineCon
     {
         if (inputIsHDR)
         {
+            // HDR→HDR passthrough: Preserve original mastering display metadata
             LOG_INFO("Preserving HDR mastering metadata from input stream");
-            add_mastering_and_cll(out.vstream, 4000);
+            bool metadata_preserved = copy_stream_hdr_metadata(in.vst, out.vstream);
+
+            // Fallback: If no metadata found in input, generate conservative defaults
+            if (!metadata_preserved)
+            {
+                LOG_WARN("HDR input lacks mastering metadata, generating conservative defaults");
+                add_mastering_and_cll(out.vstream, 4000);
+            }
         }
         else
         {
+            // SDR→HDR (THDR): Generate synthetic metadata based on tone mapping target
+            LOG_INFO("Generating HDR mastering metadata for THDR tone mapping (target: %d nits)",
+                     cfg.rtxCfg.thdrMaxLuminance);
             add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
         }
     }

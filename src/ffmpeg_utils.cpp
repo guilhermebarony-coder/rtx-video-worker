@@ -811,6 +811,139 @@ void add_mastering_and_cll(AVStream *st, int max_luminance_nits)
     }
 }
 
+// Copy HDR metadata from input stream to output stream (HDR passthrough)
+bool copy_stream_hdr_metadata(const AVStream *input_stream, AVStream *output_stream)
+{
+    if (!input_stream || !input_stream->codecpar || !output_stream || !output_stream->codecpar)
+    {
+        LOG_WARN("copy_stream_hdr_metadata: invalid stream pointers");
+        return false;
+    }
+
+    bool metadata_copied = false;
+
+    // Copy SMPTE ST 2086 mastering display metadata
+    for (int i = 0; i < input_stream->codecpar->nb_coded_side_data; i++)
+    {
+        const AVPacketSideData *src_sd = &input_stream->codecpar->coded_side_data[i];
+
+        if (src_sd->type == AV_PKT_DATA_MASTERING_DISPLAY_METADATA)
+        {
+            if (src_sd->size == sizeof(AVMasteringDisplayMetadata))
+            {
+                const AVMasteringDisplayMetadata *src_mdm = (const AVMasteringDisplayMetadata *)src_sd->data;
+
+                // Only copy if input has valid metadata
+                if (src_mdm->has_primaries || src_mdm->has_luminance)
+                {
+                    AVPacketSideData *dst_sd = av_packet_side_data_new(&output_stream->codecpar->coded_side_data,
+                                                                       &output_stream->codecpar->nb_coded_side_data,
+                                                                       AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+                                                                       sizeof(AVMasteringDisplayMetadata), 0);
+                    if (dst_sd && dst_sd->data)
+                    {
+                        memcpy(dst_sd->data, src_mdm, sizeof(AVMasteringDisplayMetadata));
+                        metadata_copied = true;
+
+                        // Log the preserved metadata for verification
+                        if (src_mdm->has_luminance)
+                        {
+                            double max_lum = av_q2d(src_mdm->max_luminance);
+                            double min_lum = av_q2d(src_mdm->min_luminance);
+                            LOG_INFO("Preserved mastering display luminance: min=%.4f cd/m², max=%.1f cd/m²",
+                                     min_lum, max_lum);
+                        }
+                        if (src_mdm->has_primaries)
+                        {
+                            LOG_DEBUG("Preserved mastering display primaries and white point");
+                        }
+                    }
+                }
+            }
+        }
+        else if (src_sd->type == AV_PKT_DATA_CONTENT_LIGHT_LEVEL)
+        {
+            if (src_sd->size == sizeof(AVContentLightMetadata))
+            {
+                const AVContentLightMetadata *src_cll = (const AVContentLightMetadata *)src_sd->data;
+
+                AVPacketSideData *dst_sd = av_packet_side_data_new(&output_stream->codecpar->coded_side_data,
+                                                                   &output_stream->codecpar->nb_coded_side_data,
+                                                                   AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+                                                                   sizeof(AVContentLightMetadata), 0);
+                if (dst_sd && dst_sd->data)
+                {
+                    memcpy(dst_sd->data, src_cll, sizeof(AVContentLightMetadata));
+                    metadata_copied = true;
+                    LOG_INFO("Preserved content light level: MaxCLL=%u cd/m², MaxFALL=%u cd/m²",
+                             src_cll->MaxCLL, src_cll->MaxFALL);
+                }
+            }
+        }
+    }
+
+    if (!metadata_copied)
+    {
+        LOG_WARN("No HDR metadata found in input stream to preserve");
+    }
+
+    return metadata_copied;
+}
+
+// Copy per-frame HDR side data (HDR10+, Dolby Vision, etc.)
+void copy_frame_hdr_side_data(const AVFrame *src_frame, AVFrame *dst_frame)
+{
+    if (!src_frame || !dst_frame)
+        return;
+
+    // HDR10+ dynamic metadata
+    const AVFrameSideData *hdr10plus_sd = av_frame_get_side_data(src_frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+    if (hdr10plus_sd)
+    {
+        AVFrameSideData *new_sd = av_frame_new_side_data(dst_frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS, hdr10plus_sd->size);
+        if (new_sd)
+            memcpy(new_sd->data, hdr10plus_sd->data, hdr10plus_sd->size);
+    }
+
+    // Dolby Vision RPU buffer
+    const AVFrameSideData *dovi_rpu_sd = av_frame_get_side_data(src_frame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+    if (dovi_rpu_sd)
+    {
+        AVFrameSideData *new_sd = av_frame_new_side_data(dst_frame, AV_FRAME_DATA_DOVI_RPU_BUFFER, dovi_rpu_sd->size);
+        if (new_sd)
+            memcpy(new_sd->data, dovi_rpu_sd->data, dovi_rpu_sd->size);
+    }
+
+    // Dolby Vision metadata
+    const AVFrameSideData *dovi_meta_sd = av_frame_get_side_data(src_frame, AV_FRAME_DATA_DOVI_METADATA);
+    if (dovi_meta_sd)
+    {
+        AVFrameSideData *new_sd = av_frame_new_side_data(dst_frame, AV_FRAME_DATA_DOVI_METADATA, dovi_meta_sd->size);
+        if (new_sd)
+            memcpy(new_sd->data, dovi_meta_sd->data, dovi_meta_sd->size);
+    }
+
+    // Copy per-frame mastering display metadata (if different from stream-level)
+    const AVFrameSideData *mdm_sd = av_frame_get_side_data(src_frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (mdm_sd && mdm_sd->size == sizeof(AVMasteringDisplayMetadata))
+    {
+        AVFrameSideData *new_sd = av_frame_new_side_data(dst_frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+                                                          sizeof(AVMasteringDisplayMetadata));
+        if (new_sd)
+            memcpy(new_sd->data, mdm_sd->data, sizeof(AVMasteringDisplayMetadata));
+    }
+
+    // Copy per-frame content light level (if different from stream-level)
+    const AVFrameSideData *cll_sd = av_frame_get_side_data(src_frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (cll_sd && cll_sd->size == sizeof(AVContentLightMetadata))
+    {
+        AVFrameSideData *new_sd = av_frame_new_side_data(dst_frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+                                                          sizeof(AVContentLightMetadata));
+        if (new_sd)
+            memcpy(new_sd->data, cll_sd->data, sizeof(AVContentLightMetadata));
+    }
+}
+
 // Helper: Check if stream mappings include audio streams
 static bool has_audio_in_mappings(const std::vector<std::string> &mappings)
 {

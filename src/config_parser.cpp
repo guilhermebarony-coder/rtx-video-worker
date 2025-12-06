@@ -97,9 +97,9 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4 (env: RTX_VSR_QUALITY)\n");
     fprintf(stderr, "\nTHDR options:\n");
     fprintf(stderr, "  --no-thdr     Disable THDR (env: RTX_NO_THDR=1)\n");
-    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 115 (env: RTX_THDR_CONTRAST)\n");
-    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 75 (env: RTX_THDR_SATURATION)\n");
-    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 30 (env: RTX_THDR_MIDDLE_GRAY)\n");
+    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 125 (env: RTX_THDR_CONTRAST)\n");
+    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 100 (env: RTX_THDR_SATURATION)\n");
+    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 25 (env: RTX_THDR_MIDDLE_GRAY)\n");
     fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000 (env: RTX_THDR_MAX_LUMINANCE)\n");
     fprintf(stderr, "\nNVENC options:\n");
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq (env: RTX_NVENC_TUNE)\n");
@@ -1146,9 +1146,9 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->rtxCfg.vsrQuality = get_env_int("RTX_VSR_QUALITY", 4);
 
     cfg->rtxCfg.enableTHDR = !get_env_bool("RTX_NO_THDR", false);
-    cfg->rtxCfg.thdrContrast = get_env_int("RTX_THDR_CONTRAST", 115);
-    cfg->rtxCfg.thdrSaturation = get_env_int("RTX_THDR_SATURATION", 75);
-    cfg->rtxCfg.thdrMiddleGray = get_env_int("RTX_THDR_MIDDLE_GRAY", 30);
+    cfg->rtxCfg.thdrContrast = get_env_int("RTX_THDR_CONTRAST", 125);
+    cfg->rtxCfg.thdrSaturation = get_env_int("RTX_THDR_SATURATION", 100);
+    cfg->rtxCfg.thdrMiddleGray = get_env_int("RTX_THDR_MIDDLE_GRAY", 25);
     cfg->rtxCfg.thdrMaxLuminance = get_env_int("RTX_THDR_MAX_LUMINANCE", 1000);
 
     const char *env_tune = get_env_var("RTX_NVENC_TUNE");

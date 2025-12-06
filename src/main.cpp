@@ -809,6 +809,10 @@ int run_pipeline(PipelineConfig cfg)
                         throw std::runtime_error("Processor failed to produce output frame");
                     }
 
+                    // Copy HDR side data from decoded frame to output frame
+                    // Preserves HDR10+, Dolby Vision, and per-frame mastering metadata
+                    copy_frame_hdr_side_data(decframe, outFrame);
+
                     // Update progress prior to encoding
                     processed_frames++;
                     show_progress();

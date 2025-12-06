@@ -929,9 +929,9 @@ Init Segment (header) → Fragment 1 → Fragment 2 → Fragment 3 → ...
 - Generates HDR10 metadata (MaxCLL, MaxFALL)
 
 **Parameters**:
-- **Contrast**: Intensity of highlights (0-200, default 115)
-- **Saturation**: Color intensity (0-200, default 75)
-- **Middle Gray**: Midpoint mapping (0-100, default 30)
+- **Contrast**: Intensity of highlights (0-200, default 125)
+- **Saturation**: Color intensity (0-200, default 100)
+- **Middle Gray**: Midpoint mapping (0-100, default 25)
 - **Max Luminance**: Peak brightness in nits (default 1000)
 
 **RTXVideoProcessor Behavior**:

@@ -94,8 +94,8 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`--no-vsr`**: Disable RTX VSR upscaling
 - **`--vsr-quality <1-4>`**: VSR quality level (default 4)
 - **`--no-thdr`**: Disable RTX TrueHDR tone mapping
-- **`--thdr-contrast <int>`**: TrueHDR contrast (default 115)
-- **`--thdr-saturation <int>`**: TrueHDR saturation (default 75)
+- **`--thdr-contrast <int>`**: TrueHDR contrast (default 125)
+- **`--thdr-saturation <int>`**: TrueHDR saturation (default 100)
 - **`--thdr-middle-gray <int>`**: TrueHDR middle gray (default 30)
 - **`--thdr-max-luminance <int>`**: TrueHDR peak luminance in nits (default 1000)
 
@@ -206,7 +206,7 @@ Notes:
   - Can be manually disabled with `--no-vsr`
 
 - **TrueHDR**
-  - Enabled by default with `{contrast=115, saturation=75, middleGray=30, maxLuminance=1000}`
+  - Enabled by default with `{contrast=125, saturation=100, middleGray=25, maxLuminance=1000}`
   - **Auto-disables** for HDR inputs (PQ/HDR10 or HLG) to preserve original HDR metadata
   - Disabling TrueHDR switches the pipeline to BT.709 SDR signaling
   - Can be manually disabled with `--no-thdr`
