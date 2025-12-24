@@ -36,6 +36,8 @@ struct PipelineConfig
     bool forcedIdr = false;   // Force IDR frames (-forced-idr)
 
     int targetBitrateMultiplier;
+    int64_t targetBitrate = -1;     // Target bitrate override (-1 = auto)
+    int64_t maxBitrate = -1;        // VBR max bitrate (-1 = 3x target)
 
     RTXProcessConfig rtxCfg;
 

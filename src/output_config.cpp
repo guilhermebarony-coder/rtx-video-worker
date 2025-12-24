@@ -142,6 +142,66 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     out->hlsOptions = hlsOpts;
 }
 
+// Calculate smart bitrate based on codec, features, and config
+static int64_t calculate_smart_bitrate(const InputContext &in, const PipelineConfig &cfg, bool inputIsHDR)
+{
+    // Check for user override
+    if (cfg.targetBitrate > 0) {
+        LOG_VERBOSE("Using user-specified bitrate: %.2f Mbps", cfg.targetBitrate / 1000000.0);
+        return cfg.targetBitrate;
+    }
+
+    // Detect input codec
+    bool is_h265 = (in.vst->codecpar->codec_id == AV_CODEC_ID_HEVC ||
+                    in.vst->codecpar->codec_id == AV_CODEC_ID_H265);
+
+    // Check features
+    bool has_upscale = cfg.rtxCfg.enableVSR;
+    bool has_thdr = cfg.rtxCfg.enableTHDR;
+
+    // Base multiplier from config
+    double multiplier = cfg.targetBitrateMultiplier;
+
+    // Apply codec and feature-aware scaling
+    double feature_scale = 1.0;
+    if (has_upscale && has_thdr) {
+        feature_scale = is_h265 ? 1.5 : 2.0;
+    } else if (has_upscale) {
+        feature_scale = is_h265 ? 1.2 : 1.5;
+    } else if (has_thdr) {
+        feature_scale = is_h265 ? 1.1 : 1.3;
+    } else {
+        feature_scale = is_h265 ? 0.8 : 1.0;
+    }
+
+    multiplier *= feature_scale;
+
+    // HDR input adjustment
+    if (inputIsHDR) {
+        multiplier *= 0.8;
+    }
+
+    // Calculate target bitrate
+    int64_t input_bitrate = in.fmt->bit_rate;
+    int64_t target_bitrate;
+
+    if (input_bitrate > 0) {
+        target_bitrate = (int64_t)(input_bitrate * multiplier);
+    } else {
+        target_bitrate = 25000000; // 25 Mbps fallback
+    }
+
+    // Detailed logging
+    LOG_VERBOSE("Bitrate calc: codec=%s, upscale=%d, thdr=%d, inputHDR=%d",
+                is_h265 ? "H265" : "H264/other", has_upscale, has_thdr, inputIsHDR);
+    LOG_VERBOSE("  base_mult=%.2f, feature_scale=%.2f, final_mult=%.2f",
+                (double)cfg.targetBitrateMultiplier, feature_scale, multiplier);
+    LOG_VERBOSE("  input=%.2f Mbps, target=%.2f Mbps",
+                input_bitrate / 1000000.0, target_bitrate / 1000000.0);
+
+    return target_bitrate;
+}
+
 // Configure video encoder
 AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, OutputContext &out,
                                      bool inputIsHDR, bool use_cuda_path, int dstW, int dstH,
@@ -280,8 +340,7 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
         out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
-    LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
+    int64_t target_bitrate = calculate_smart_bitrate(in, cfg, inputIsHDR);
     if (cfg.gopFrames >= 0)
     {
         LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d frames (via -g), bframes: %d",
@@ -297,9 +356,53 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
     av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
     av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
+
+    // Apply bitrate to encoder (required for CBR/VBR)
+    out.venc->bit_rate = target_bitrate;
+
+    // CBR/VBR specific settings
+    if (cfg.rc == "cbr") {
+        // CBR: fixed bitrate, maxrate = bitrate
+        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate, 0);
+        int64_t bufsize = target_bitrate * 2;
+        av_opt_set_int(out.venc->priv_data, "bufsize", bufsize, 0);
+        LOG_VERBOSE("CBR: bitrate=%.2f Mbps, bufsize=%.2f Mbps",
+                    target_bitrate / 1000000.0, bufsize / 1000000.0);
+    } else if (cfg.rc == "vbr" || cfg.rc == "vbr_hq") {
+        // VBR: target bitrate (avg) + maxrate (peak)
+        int64_t maxrate;
+        if (cfg.maxBitrate > 0) {
+            maxrate = cfg.maxBitrate;
+        } else {
+            maxrate = (int64_t)(target_bitrate * 3.0);  // Default: 3x for quality
+        }
+
+        // Validate maxrate >= target
+        if (maxrate < target_bitrate) {
+            LOG_WARN("VBR maxrate (%.2f Mbps) < target (%.2f Mbps), adjusting to target",
+                     maxrate / 1000000.0, target_bitrate / 1000000.0);
+            maxrate = target_bitrate;
+        }
+
+        int64_t bufsize = maxrate * 2;
+        av_opt_set_int(out.venc->priv_data, "maxrate", maxrate, 0);
+        av_opt_set_int(out.venc->priv_data, "bufsize", bufsize, 0);
+
+        double variance_pct = ((double)(maxrate - target_bitrate) / target_bitrate) * 100.0;
+        LOG_VERBOSE("VBR: target=%.2f Mbps, maxrate=%.2f Mbps (+%.1f%%), bufsize=%.2f Mbps",
+                    target_bitrate / 1000000.0, maxrate / 1000000.0, variance_pct, bufsize / 1000000.0);
+
+        if (variance_pct > 100.0) {
+            LOG_WARN("VBR variance high (+%.1f%%), bitrate may spike. Use --nvenc-maxrate to limit.", variance_pct);
+        }
+    }
+    // CQP mode ignores bitrate, uses QP instead
+
     av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
-    av_opt_set_int(out.venc->priv_data, "async_depth", 4, 0);
-    av_opt_set_int(out.venc->priv_data, "rc-lookahead", 8, 0);
+    // Reduced from 4 to 2 for better VRAM efficiency (supports 4K→8K upscaling within 12GB VRAM)
+    av_opt_set_int(out.venc->priv_data, "async_depth", 2, 0);
+    // Reduced from 8 to 4 to halve lookahead memory usage while maintaining quality benefits
+    av_opt_set_int(out.venc->priv_data, "rc-lookahead", 4, 0);
 
     // Apply advanced keyframe control options
     if (cfg.scThreshold >= 0)
@@ -359,9 +462,10 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
         fctx->sw_format = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
         fctx->width = dstW;
         fctx->height = dstH;
-        // Increased from 64 to 96 to handle high-throughput processing
-        // This provides more surfaces for the encoder during burst encoding
-        fctx->initial_pool_size = 96;
+        // Optimized pool size for VRAM efficiency (reduced from 96 to 32)
+        // Balanced for all resolutions: keeps 8K encoding under 8GB VRAM budget
+        // 32 frames @ 8K (7680x4320 P010) = ~3.2GB, @ 4K = ~800MB
+        fctx->initial_pool_size = 32;
         ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
         out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
     }

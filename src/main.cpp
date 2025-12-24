@@ -134,9 +134,10 @@ static void initialize_frame_buffers_and_contexts(bool use_cuda_path, int dstW, 
     if (use_cuda_path)
     {
         // Initialize CUDA frame pool for GPU path
-        // Increased from 8 to 16 to prevent pool exhaustion during high-throughput processing (90+ fps)
-        // This provides more working buffers for the RTX processor and encoder pipeline
-        const int POOL_SIZE = 16;
+        // Optimized to 8 frames for VRAM efficiency (reduced from 16)
+        // Balanced for all resolutions: 8K = ~792MB, 4K = ~200MB
+        // Sufficient for smooth operation while supporting 4K→8K upscaling within 12GB VRAM
+        const int POOL_SIZE = 8;
         cuda_pool.initialize(out.venc->hw_frames_ctx, dstW, dstH, POOL_SIZE);
     }
     else
@@ -353,6 +354,9 @@ int run_pipeline(PipelineConfig cfg)
         open_input(cfg.inputPath, in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
+        // Pass HDR detection to RTX config for proper pipeline selection
+        cfg.rtxCfg.inputIsHDR = inputIsHDR;
+
         // Stage 2: Configure VSR auto-disable
         configure_vsr_auto_disable(cfg, in);
 
@@ -553,7 +557,7 @@ int run_pipeline(PipelineConfig cfg)
         std::unique_ptr<IProcessor> processor;
         if (use_cuda_path)
         {
-            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, outputHDR);
+            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, outputHDR, inputIsHDR);
         }
         else
         {

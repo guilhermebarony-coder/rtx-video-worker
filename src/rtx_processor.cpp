@@ -60,7 +60,10 @@ bool RTXProcessor::initialize(int gpuIndex, const RTXProcessConfig &cfg, uint32_
         setError(std::string("RTX API create failed (THDR=") + (cfg.enableTHDR ? "1" : "0") + ", VSR=" + (cfg.enableVSR ? "1" : "0") + ")");
         return false;
     }
-    if (!allocSurfaces(cfg.enableTHDR))
+    // For HDR input without THDR, use 10-bit source array for VSR
+    // For SDR input (even Main10), use 8-bit source array for VSR
+    bool need10BitSource = cfg.inputIsHDR && !cfg.enableTHDR;
+    if (!allocSurfaces(cfg.enableTHDR, need10BitSource))
     {
         if (cfg.enableTHDR)
         {
@@ -68,7 +71,7 @@ bool RTXProcessor::initialize(int gpuIndex, const RTXProcessConfig &cfg, uint32_
         }
         else
         {
-            setError("allocSurfaces failed while creating BGRA surfaces");
+            setError("allocSurfaces failed while creating surfaces");
         }
         return false;
     }
@@ -624,7 +627,10 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
         setError(std::string("RTX API create failed (THDR=") + (cfg.enableTHDR ? "1" : "0") + ", VSR=" + (cfg.enableVSR ? "1" : "0") + ")");
         return false;
     }
-    if (!allocSurfaces(cfg.enableTHDR))
+    // For HDR input without THDR, use 10-bit source array for VSR
+    // For SDR input (even Main10), use 8-bit source array for VSR
+    bool need10BitSource = cfg.inputIsHDR && !cfg.enableTHDR;
+    if (!allocSurfaces(cfg.enableTHDR, need10BitSource))
     {
         setError("allocSurfaces failed in initializeWithContext");
         return false;
@@ -764,13 +770,15 @@ void RTXProcessor::destroyRTX()
     rtx_video_api_cuda_shutdown();
 }
 
-bool RTXProcessor::allocSurfaces(bool thdr)
+bool RTXProcessor::allocSurfaces(bool thdr, bool hdr10BitInput)
 {
-    // Create source array BGRA8
+    // Create source array: 10-bit for HDR input, 8-bit for SDR input
+    // HDR content (PQ/HLG) requires 10-bit precision through VSR pipeline
+    // SDR content (even in Main10/P010) uses 8-bit for VSR
     CUDA_ARRAY_DESCRIPTOR srcDesc{};
     srcDesc.Width = m_srcW;
     srcDesc.Height = m_srcH;
-    srcDesc.Format = CU_AD_FORMAT_UNSIGNED_INT8;
+    srcDesc.Format = hdr10BitInput ? CU_AD_FORMAT_UNORM_INT_101010_2 : CU_AD_FORMAT_UNSIGNED_INT8;
     srcDesc.NumChannels = 4;
 
     CUDADRV_CHECK(cuArrayCreate(&m_srcArray, &srcDesc));

@@ -102,12 +102,14 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 **Encoder Settings**
 - **`--nvenc-tune <string>`**: NVENC tune (default `hq`)
 - **`--nvenc-preset <string>`**: NVENC preset (default `p7`)
-- **`--nvenc-rc <string>`**: NVENC rate control mode (default `constqp`)
+- **`--nvenc-rc <string>`**: NVENC rate control mode (default `constqp`, options: `cbr`, `vbr`, `vbr_hq`, `constqp`)
 - **`--nvenc-gop <int>`**: GOP length in seconds as `gop * fps` (default 3)
 - **`--nvenc-bframes <int>`**: Maximum B-frame count (default 2)
-- **`--nvenc-qp <int>`**: Constant QP (default 21 when `constqp` is active)
-- **`--nvenc-bitrate-multiplier <int>`**: Bitrate multiplier (default 5×, fallback 25 Mbps)
- - **`-r <fps>`, `-r:v <fps>`**: Override output framerate
+- **`--nvenc-qp <int>`**: Constant QP (default 21, only used when `--nvenc-rc constqp`)
+- **`--nvenc-bitrate-multiplier <float>`**: Smart bitrate multiplier (default 2.0, fallback 25 Mbps)
+- **`--nvenc-bitrate <mbps>`**: Target bitrate override (CBR: fixed rate, VBR: average rate)
+- **`--nvenc-maxrate <mbps>`**: VBR max bitrate (default: 3× target, ignored for CBR)
+- **`-r <fps>`, `-r:v <fps>`**: Override output framerate
    - Works with `-vsync cfr` to produce a constant frame rate timeline
    - Encoder timebase is chosen to yield exact ticks-per-frame for CFR when possible; otherwise an integer timescale is used
 
@@ -212,10 +214,18 @@ Notes:
   - Can be manually disabled with `--no-thdr`
 
 - **NVENC**
-  - Uses Main10 profile, constant QP 21, preset `p7`, tune `hq`
+  - Uses Main10 profile, preset `p7`, tune `hq`
+  - **Rate control**: Default `constqp` with QP 21 (options: `cbr`, `vbr`, `vbr_hq`, `constqp`)
+  - **Smart bitrate calculation** (CBR/VBR modes):
+    - Codec-aware: H.265 ~30% lower bitrate than H.264 for same quality
+    - Feature-aware: Scales based on upscale + THDR combinations
+    - HDR input: 0.8× adjustment to preserve quality
+    - Example: H.264 input with upscale+THDR → 2.0× base multiplier
+    - Example: H.265 input with upscale only → 1.2× base multiplier
+    - Fallback: 25 Mbps if input bitrate unknown
+  - **VBR max bitrate**: Auto-calculated as 3× target (quality-focused), adjustable via `--nvenc-maxrate`
   - GOP length: `3 × fps` frames
   - B-frames: 2 (default)
-  - Bitrate: `input_bitrate × 5` (fallback: 25 Mbps if unknown)
   - Hardware pool: 64-frame surfaces
 
 - **Color metadata**
@@ -258,8 +268,17 @@ RTXVideoProcessor.exe input.mp4 output.mp4 --no-vsr
 # SDR output (disable both RTX features)
 RTXVideoProcessor.exe input.mp4 output_sdr.mp4 --no-vsr --no-thdr
 
-# Custom NVENC settings
-RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate-multiplier 3 --nvenc-preset p4
+# CBR encoding at fixed 10 Mbps
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc cbr --nvenc-bitrate 10
+
+# VBR encoding: 8 Mbps average, 24 Mbps peak (default 3x)
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate 8
+
+# VBR with custom max rate for streaming (tight ceiling)
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate 8 --nvenc-maxrate 12
+
+# Smart bitrate with higher multiplier
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate-multiplier 2.5
 
 # CPU processing path (no GPU)
 RTXVideoProcessor.exe input.mp4 output.mp4 --cpu --no-vsr
@@ -418,7 +437,11 @@ The resulting binary will be at `build-static/Release/RTXVideoProcessor.exe` (~2
 ## Troubleshooting
 - **CUDA negotiation** If CUDA initialization fails, verify the GPU driver, confirm the Video Codec SDK DLLs are present, and try `--cpu` to validate the rest of the pipeline.
 - **HDR validation** When TrueHDR is enabled, ensure your playback tool honors the inserted mastering metadata; fall back to `--no-thdr` for SDR deliveries.
-- **Bitrate control** Tune `--nvenc-rc`, `--nvenc-qp`, or `--nvenc-bitrate-multiplier` to meet delivery requirements.
+- **Bitrate control**
+  - **CQP mode** (default): Use `--nvenc-qp` to control quality (lower = higher quality)
+  - **CBR mode**: Use `--nvenc-bitrate` for fixed bitrate streaming
+  - **VBR mode**: Use `--nvenc-bitrate` for target and `--nvenc-maxrate` to limit peaks
+  - **Smart calculation**: Adjust `--nvenc-bitrate-multiplier` for auto-scaling based on codec and features
 
 ## TODO
 - Resolve stutters at specific presets

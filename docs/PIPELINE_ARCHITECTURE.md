@@ -403,11 +403,13 @@ The configuration system supports three levels of precedence (highest to lowest)
 - `RTX_THDR_MAX_LUMINANCE`: THDR max luminance in nits (default: 1000)
 - `RTX_NVENC_TUNE`: NVENC tune preset (default: "hq")
 - `RTX_NVENC_PRESET`: NVENC encoding preset (default: "p7")
-- `RTX_NVENC_RC`: NVENC rate control mode (default: "constqp")
+- `RTX_NVENC_RC`: NVENC rate control mode (default: "constqp", options: cbr/vbr/vbr_hq/constqp)
 - `RTX_NVENC_GOP`: GOP length in seconds (default: 3)
 - `RTX_NVENC_BFRAMES`: Max B-frames (default: 2)
 - `RTX_NVENC_QP`: Constant QP value (default: 21)
-- `RTX_NVENC_BITRATE_MULTIPLIER`: Bitrate multiplier (default: 2)
+- `RTX_NVENC_BITRATE_MULTIPLIER`: Smart bitrate multiplier (default: 2)
+- `RTX_NVENC_BITRATE`: Target bitrate override in bps (default: -1 for auto)
+- `RTX_NVENC_MAXRATE`: VBR max bitrate in bps (default: -1 for 3× target)
 
 **Key Configuration Fields**:
 ```cpp

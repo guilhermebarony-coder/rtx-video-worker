@@ -31,8 +31,26 @@ bool configure_input_hdr_detection(PipelineConfig &cfg, InputContext &in)
     if (in.vst && in.vst->codecpar)
     {
         AVColorTransferCharacteristic trc = in.vst->codecpar->color_trc;
+        AVColorPrimaries primaries = in.vst->codecpar->color_primaries;
+
+        // Log what we found for debugging
+        LOG_DEBUG("Input stream color properties: trc=%d, primaries=%d, colorspace=%d",
+                  trc, primaries, in.vst->codecpar->color_space);
+
+        // Primary detection: transfer characteristic (most reliable for HDR)
         inputIsHDR = (trc == AVCOL_TRC_SMPTE2084) ||  // PQ (HDR10)
                      (trc == AVCOL_TRC_ARIB_STD_B67); // HLG (Hybrid Log-Gamma)
+
+        // Fallback: if trc is unspecified but primaries indicate HDR
+        if (!inputIsHDR && trc == AVCOL_TRC_UNSPECIFIED)
+        {
+            // BT.2020 primaries often indicate HDR content
+            if (primaries == AVCOL_PRI_BT2020)
+            {
+                LOG_DEBUG("Transfer unspecified but BT.2020 primaries detected, checking for HDR side data...");
+                // Don't assume HDR just from primaries - wait for actual frame decoding
+            }
+        }
     }
 
     if (inputIsHDR)
@@ -42,7 +60,6 @@ bool configure_input_hdr_detection(PipelineConfig &cfg, InputContext &in)
             LOG_INFO("Input content is HDR (transfer characteristic: %s). Disabling THDR to preserve HDR metadata.",
                      in.vst->codecpar->color_trc == AVCOL_TRC_SMPTE2084 ? "PQ/HDR10" : "HLG");
             cfg.rtxCfg.enableTHDR = false;
-            cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier * 0.8;
         }
 
         // Reopen input with P010 preference for HDR content
@@ -68,13 +85,12 @@ void configure_vsr_auto_disable(PipelineConfig &cfg, const InputContext &in)
 {
     if (cfg.rtxCfg.enableVSR)
     {
-        bool ge1080p = (in.vdec->width > 2560 && in.vdec->height > 1440) ||
-                       (in.vdec->width > 1440 && in.vdec->height > 2560);
-        if (ge1080p)
+        bool ge4k = (in.vdec->width > 3840 && in.vdec->height > 2160) ||
+                       (in.vdec->width > 2160 && in.vdec->height > 3840);
+        if (ge4k)
         {
-            LOG_INFO("Input resolution is %dx%d (>=1080p). Disabling VSR.", in.vdec->width, in.vdec->height);
+            LOG_INFO("Input resolution is %dx%d (>=4k). Disabling VSR.", in.vdec->width, in.vdec->height);
             cfg.rtxCfg.enableVSR = false;
-            cfg.targetBitrateMultiplier = cfg.targetBitrateMultiplier / 2.0;
         }
     }
 }

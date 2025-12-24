@@ -159,7 +159,7 @@ bool open_input(const char *inPath, InputContext &in, const InputOpenOptions *op
                 dec_fctx->sw_format = AV_PIX_FMT_P010LE; // Request P010 for HDR content
                 dec_fctx->width = in.vst->codecpar->width;
                 dec_fctx->height = in.vst->codecpar->height;
-                dec_fctx->initial_pool_size = 64;
+                dec_fctx->initial_pool_size = 20;
 
                 if (av_hwframe_ctx_init(dec_hw_frames) >= 0)
                 {

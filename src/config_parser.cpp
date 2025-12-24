@@ -61,6 +61,23 @@ static int get_env_int(const char *name, int default_value)
     }
 }
 
+// Helper function: get environment variable as int64_t with default
+static int64_t get_env_int64(const char *name, int64_t default_value)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return default_value;
+    try
+    {
+        return std::stoll(value);
+    }
+    catch (...)
+    {
+        fprintf(stderr, "Warning: Invalid int64 value for %s: %s (using default: %lld)\n", name, value, (long long)default_value);
+        return default_value;
+    }
+}
+
 // Helper function: get environment variable as boolean (1/true/yes = true, 0/false/no = false)
 static bool get_env_bool(const char *name, bool default_value)
 {
@@ -110,6 +127,8 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2 (env: RTX_NVENC_BFRAMES)\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21 (env: RTX_NVENC_QP)\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2 (env: RTX_NVENC_BITRATE_MULTIPLIER)\n");
+    fprintf(stderr, "  --nvenc-bitrate <mbps>  Set target bitrate (CBR: fixed, VBR: average) (env: RTX_NVENC_BITRATE)\n");
+    fprintf(stderr, "  --nvenc-maxrate <mbps>  Set VBR max bitrate, default 3x target (env: RTX_NVENC_MAXRATE)\n");
     fprintf(stderr, "\nAdvanced keyframe control:\n");
     fprintf(stderr, "  -sc_threshold <int> Scene change threshold 0-100 (x264/x265 only, not NVENC)\n");
     fprintf(stderr, "  -keyint_min <int>   Minimum GOP length in frames\n");
@@ -1126,6 +1145,34 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
         }
+        else if (arg == "--nvenc-bitrate")
+        {
+            if (i + 1 < argc)
+            {
+                double mbps = std::stod(argv[++i]);
+                cfg->targetBitrate = (int64_t)(mbps * 1000000);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for --nvenc-bitrate\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "--nvenc-maxrate")
+        {
+            if (i + 1 < argc)
+            {
+                double mbps = std::stod(argv[++i]);
+                cfg->maxBitrate = (int64_t)(mbps * 1000000);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for --nvenc-maxrate\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
 
         else
         {
@@ -1166,6 +1213,8 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->bframes = get_env_int("RTX_NVENC_BFRAMES", 2);
     cfg->qp = get_env_int("RTX_NVENC_QP", 21);
     cfg->targetBitrateMultiplier = get_env_int("RTX_NVENC_BITRATE_MULTIPLIER", 2);
+    cfg->targetBitrate = get_env_int64("RTX_NVENC_BITRATE", -1);
+    cfg->maxBitrate = get_env_int64("RTX_NVENC_MAXRATE", -1);
 
     // Determine parsing mode: simple (input output [opts]) vs FFmpeg-compatible (-i input -f format output)
     // Simple mode: first arg is input file (positional)

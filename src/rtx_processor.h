@@ -18,6 +18,7 @@ struct RTXProcessConfig
 {
     bool enableVSR = true;
     bool enableTHDR = true;
+    bool inputIsHDR = false; // True for PQ/HLG transfer (HDR10, Dolby Vision, HLG)
     int vsrQuality = 4;  // 1..4 (4=highest)
     int scaleFactor = 2; // 2x
     // TrueHDR defaults per sample
@@ -129,7 +130,7 @@ private:
     bool createRTX(bool thdr, bool vsr);
     void destroyRTX();
 
-    bool allocSurfaces(bool thdr);
+    bool allocSurfaces(bool thdr, bool hdr10BitInput);
     void freeSurfaces();
 
     void setError(const std::string &msg) { m_lastError = msg; }

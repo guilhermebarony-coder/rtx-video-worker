@@ -79,10 +79,18 @@ bool parse_map_spec(const std::string &map_arg, StreamMapSpec &spec)
     else if (*p == ':')
     {
         // FFmpeg allows omitting input file index (defaults to 0)
-        // e.g., "-map v:0" is equivalent to "-map 0:v:0"
+        // e.g., ":v:0" is equivalent to "0:v:0"
         spec.input_file_index = 0;
         p++; // Skip ':'
         LOG_DEBUG("Map specifier '%s' missing input index, defaulting to 0", map_arg.c_str());
+    }
+    else if ((*p == 'v' || *p == 'V' || *p == 'a' || *p == 's' || *p == 'd' || *p == 't' || *p == 'm') &&
+             (*(p + 1) == ':' || *(p + 1) == '?' || *(p + 1) == '\0'))
+    {
+        // FFmpeg allows omitting input file index when starting with media type
+        // e.g., "v:0" is equivalent to "0:v:0"
+        spec.input_file_index = 0;
+        LOG_DEBUG("Map specifier '%s' missing input index before media type, defaulting to 0", map_arg.c_str());
     }
     else
     {
