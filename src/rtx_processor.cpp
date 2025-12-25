@@ -795,11 +795,16 @@ bool RTXProcessor::allocSurfaces(bool thdr, bool hdr10BitInput)
 
     CUDADRV_CHECK(cuTexObjectCreate(&m_srcTex, &srcRes, &texDesc, nullptr));
 
-    // Destination: if THDR, we need 10-bit A2R10G10B10 (UNORM 10:10:10:2)
+    // Destination: use 10-bit A2R10G10B10 (UNORM 10:10:10:2) whenever we are in a 10-bit
+    // HDR pipeline (hdr10BitInput), or when TrueHDR is enabled. This ensures that when
+    // the input to VSR is 10-bit (AGBR10/X2BGR10), the output surface remains 10-bit
+    // ABGR10 even if THDR is disabled, matching the expectations of the abgr10_to_p010
+    // conversion path.
     CUDA_ARRAY_DESCRIPTOR dstDesc{};
     dstDesc.Width = m_dstW;
     dstDesc.Height = m_dstH;
-    dstDesc.Format = thdr ? CU_AD_FORMAT_UNORM_INT_101010_2 : CU_AD_FORMAT_UNSIGNED_INT8;
+    dstDesc.Format = (thdr || hdr10BitInput) ? CU_AD_FORMAT_UNORM_INT_101010_2
+                                             : CU_AD_FORMAT_UNSIGNED_INT8;
     dstDesc.NumChannels = 4;
 
     CUresult cres = cuArrayCreate(&m_dstArray, &dstDesc);
