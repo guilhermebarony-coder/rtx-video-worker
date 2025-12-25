@@ -96,7 +96,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`--no-thdr`**: Disable RTX TrueHDR tone mapping
 - **`--thdr-contrast <int>`**: TrueHDR contrast (default 125)
 - **`--thdr-saturation <int>`**: TrueHDR saturation (default 100)
-- **`--thdr-middle-gray <int>`**: TrueHDR middle gray (default 30)
+- **`--thdr-middle-gray <int>`**: TrueHDR middle gray (default 25)
 - **`--thdr-max-luminance <int>`**: TrueHDR peak luminance in nits (default 1000)
 
 **Encoder Settings**
@@ -163,8 +163,9 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
   - When disabled (default, `0`): adds stream `start_time` to seek position (FFmpeg default behavior)
   - When enabled (`1`): seeks to absolute timestamp without adjustment
   - FFmpeg compatibility option for streams with non-zero start times
-- **`-vsync <mode>`**: Video synchronization mode
+- **`-vsync <mode>`** or **`-fps_mode <mode>`**: Video synchronization mode
   - `cfr`: Constant frame rate - generates evenly spaced timestamps
+  - `passthrough`/`vfr`: Variable frame rate (default behavior)
   - Useful for fixing variable frame rate issues or ensuring consistent playback timing
 
 **HLS Streaming**

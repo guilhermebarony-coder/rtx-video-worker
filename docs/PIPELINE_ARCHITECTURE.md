@@ -413,44 +413,65 @@ The configuration system supports three levels of precedence (highest to lowest)
 
 **Key Configuration Fields**:
 ```cpp
-struct Config {
+struct PipelineConfig {
     // Input/Output
-    const char* inputPath; // DEPRECATED in favor of inputPaths
-    std::vector<std::string> inputPaths; // Multiple -i inputs
-    const char* outputPath;
+    char *inputPath;  // DEPRECATED: Use inputPaths for multi-input support
+    std::vector<std::string> inputPaths;  // Multiple -i inputs (v2.6+)
+    char *outputPath;
 
     // Processing modes
     bool cpuOnly;
     bool defaultMode;
     bool ffCompatible;
 
-    // Stream mapping
-    std::vector<std::string> streamMaps;  // -map arguments
-    // Disable flags (FFmpeg parity)
-    bool disableVideo, disableAudio, disableSubtitle, disableData; // -vn/-an/-sn/-dn
-    // Metadata/chapters mapping
-    int mapMetadata; bool hasMapMetadata;
-    int mapChapters; bool hasMapChapters;
+    // Stream mapping (v2.6+)
+    std::vector<std::string> streamMaps;  // Raw -map arguments
+    bool disableVideo;    // -vn: Disable video streams
+    bool disableAudio;    // -an: Disable audio streams
+    bool disableSubtitle; // -sn: Disable subtitle streams
+    bool disableData;     // -dn: Disable data streams
+    int mapMetadata;      // -map_metadata: -1 = disable, 0+ = input index
+    bool hasMapMetadata;  // Track if explicitly set
+    int mapChapters;      // -map_chapters: -1 = disable, 0+ = input index
+    bool hasMapChapters;  // Track if explicitly set
 
     // Audio
     std::string audioCodec;
+    bool audioCodecApplyToAll;  // true for -codec:a, false for -codec:a:0 (v2.6+)
     int audioChannels;
     int audioBitrate;
+    int audioSampleRate;
+    std::string audioFilter;
+
+    // NVENC settings
+    int gop;              // GOP in seconds (--nvenc-gop)
+    int gopFrames;        // GOP in frames (-g), takes precedence (v2.6+)
+    int bframes;
+    int qp;
+    int64_t targetBitrate;  // Target bitrate override (--nvenc-bitrate) (v2.6+)
+    int64_t maxBitrate;     // VBR max bitrate (--nvenc-maxrate) (v2.6+)
+    int scThreshold;      // Scene change threshold (-sc_threshold) (v2.6+)
+    int keyintMin;        // Minimum GOP length (-keyint_min) (v2.6+)
+    bool noScenecut;      // Disable scene detection (-no-scenecut) (v2.6+)
+    bool forcedIdr;       // Force IDR frames (-forced-idr) (v2.6+)
 
     // Seeking
     std::string seekTime;
-    std::string duration;  // NEW: -t option support
+    std::string duration;  // -t option support
     bool seek2any;
     bool seekTimestamp;
 
     // Timestamp options
     bool copyts;
     bool startAtZero;
-    AvoidNegativeTs avoidNegativeTs;
+    std::string avoidNegativeTs;
+    std::string vsync;           // -vsync or -fps_mode
+    std::string outputFrameRate; // -r or -r:v (v2.6+)
+    std::string outputTsOffset;  // -output_ts_offset
 
     // Output format
     std::string outputFormat;
-    HLS options (hlsTime, segmentType, hlsFlags, hlsSegmentOptions, etc.)
+    // HLS options (hlsTime, segmentType, hlsFlags, hlsSegmentOptions, etc.)
 };
 ```
 
@@ -596,9 +617,11 @@ struct InputContext {
     int vstream;                 // Video stream index
     AVStream *vst;               // Video stream
     AVCodecContext *vdec;        // Video decoder
-    // Multi-audio support
-    std::map<int, AVCodecContext*> audio_decoders; // stream_index -> decoder
-    int primary_audio_stream;    // best audio stream index (for info)
+    
+    // Multi-audio support (v2.6+)
+    std::map<int, AVCodecContext*> audio_decoders; // stream_index -> decoder context
+    int primary_audio_stream;    // "Best" audio stream index (for info/logging)
+    
     AVBufferRef *hw_device_ctx;  // CUDA device
     int64_t seek_offset_us;      // Seek offset for sync
 };
@@ -1924,7 +1947,7 @@ cpuProc->setConfig(cpuConfig);
 | **Config Parsing** | src/config_parser.cpp | src/config_parser.h |
 | **Input Setup** | src/input_config.cpp | src/ffmpeg_utils.cpp (open_input) |
 | **Output Setup** | src/output_config.cpp | src/ffmpeg_utils.cpp (open_output) |
-| **Stream Mapping** | src/ffmpeg_utils.cpp | decide_stream_mappings() |
+| **Stream Mapping** | src/stream_mapper.cpp | src/stream_mapper.h, parse_map_spec(), resolve_stream_mapping() |
 | **Timestamp Manager** | src/timestamp_manager.h | - |
 | **Audio Processing** | src/ffmpeg_utils.cpp | process_audio_frame(), setup_audio_encoder() |
 | **RTX Processing** | src/rtx_processor.cpp | src/processor.h |
@@ -1976,6 +1999,40 @@ The timestamp manager tracks minimal statistics. Detailed timestamp validation (
 ---
 
 ## Version History
+
+- **v2.6** (2025-12-25): Multi-input and multi-audio stream support
+  - **Multi-input support**: Added `inputPaths` vector for multiple `-i` inputs (experimental)
+    - New `StreamMapSpec` and `MappedStream` structures for multi-input stream mapping
+    - New `stream_mapper.cpp/h` files for parsing and resolving `-map` arguments
+  - **Multi-audio stream support**: Per-stream audio encoding with `AudioEncoderContext`
+    - `audio_decoders` map in `InputContext` for multiple audio decoders
+    - `audio_encoders` map in `OutputContext` for per-stream encoding
+    - Each audio stream has its own FIFO, resampler, filter graph, and `accumulated_samples` counter
+  - **New CLI options**:
+    - `-vn`, `-an`, `-sn`, `-dn`: Stream disable flags (FFmpeg parity)
+    - `-map_metadata`, `-map_chapters`: Metadata and chapter mapping
+    - `-g`, `-sc_threshold`, `-keyint_min`, `-no-scenecut`, `-forced-idr`: Advanced GOP control
+    - `--nvenc-bitrate`, `--nvenc-maxrate`: Direct bitrate overrides
+    - `-fps_mode`: Alias for `-vsync`
+    - `-r`, `-r:v`: Output framerate override
+    - `-codec:a` vs `-codec:a:0`: Distinction between all-audio and first-audio codec application
+  - **CFR improvements**: New `cfrSync()` method in TimestampManager for FFmpeg-compliant CFR mode
+    - Enhanced HLS timestamp handling with `output_ts_offset`
+    - `getCopytsBaseline()` and `hasCopytsBaseline()` accessors
+  - **RTX processor changes**:
+    - `inputIsHDR` flag in `RTXProcessConfig` for proper HDR pipeline selection
+    - `syncStream()` method for explicit CUDA synchronization
+    - 10-bit source array support for HDR input without THDR
+  - **Default THDR values updated**: contrast 115→125, saturation 75→100, middleGray 30→25
+  - **Utility additions**: `is_pipe_output()` function in utils.cpp/h
+  - **DTS monotonicity**: Added `last_video_dts` tracking in OutputContext for video packets
+  - **HDR VSR fix**: Changed VSR output format to use 10-bit for HDR input
+    - Maintains full 10-bit color depth throughout the processing pipeline
+  - **Buffer fix**: Use source-sized buffer for P010→X2BGR10LE conversion
+
+  - **CBR/VBR improvements**: Enhanced automatic bitrate calculation
+    - Better bitrate adaptation for different input resolutions and quality settings
+    - Tested with 4K→8K upscaling scenarios
 
 - **v2.4** (2025-01-25): Audio FIFO draining fix for HLS segment boundaries
   - **BREAKING FIX**: Corrected audio packet distribution across HLS segments

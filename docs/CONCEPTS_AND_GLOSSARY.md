@@ -1012,6 +1012,12 @@ Muxer → Output File
 - Contains encoded video/audio bitstream
 - Includes PTS, DTS, duration
 
+**AudioEncoderContext**
+- RTXVideoProcessor structure for per-stream audio encoding
+- Contains encoder, resampler, FIFO, filter graph for each audio stream
+- Tracks `accumulated_samples` for sample-accurate PTS
+- Tracks `last_dts` for DTS monotonicity enforcement
+
 **AVSEEK_FLAG_BACKWARD**
 - Seek to nearest keyframe before target
 - Default FFmpeg seeking behavior
@@ -1484,6 +1490,17 @@ Muxer → Output File
 - Processing without unnecessary memory copies
 - GPU pipeline: data stays on GPU throughout
 
+**StreamMapSpec**
+- Parsed representation of a `-map` argument
+- Contains input file index, stream index, stream type filter
+- Supports negative maps (exclusions) and optional maps
+- Supports metadata filtering (e.g., `0:m:language:eng`)
+
+**MappedStream**
+- Resolved mapping for a specific output stream
+- Links input file/stream to output stream
+- Indicates whether stream requires processing or copy
+
 ---
 
 ## Additional Resources
@@ -1496,4 +1513,4 @@ Muxer → Output File
 
 ---
 
-**Document Version**: 1.0 (2025-01-21)
+**Document Version**: 1.1 (2025-12-25)
