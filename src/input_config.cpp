@@ -73,7 +73,7 @@ bool configure_input_hdr_detection(PipelineConfig &cfg, InputContext &in)
         inputOpts.seekTimestamp = cfg.seekTimestamp;
         inputOpts.enableErrorConcealment = !cfg.ffCompatible;
         inputOpts.flushOnSeek = false;
-        open_input(cfg.inputPath, in, &inputOpts);
+        open_input(cfg.inputPaths.empty() ? nullptr : cfg.inputPaths[0].c_str(), in, &inputOpts);
         LOG_INFO("Configured decoder for P010 output to preserve full 10-bit HDR pipeline");
     }
 

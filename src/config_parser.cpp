@@ -201,11 +201,6 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             char *path = extract_ffmpeg_file_path(argv[++i]);
             // Support multiple -i flags for multi-input
             cfg->inputPaths.push_back(path);
-            // Keep first input in inputPath for backward compatibility
-            if (!cfg->inputPath)
-            {
-                cfg->inputPath = path;
-            }
         }
         else if (arg == "-max_delay")
         {
@@ -545,7 +540,7 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             // Determine if this is input seeking or output seeking based on context
             // If we haven't seen -i yet, it's input seeking
             // If we have seen -i, it's output seeking
-            if (cfg->inputPath == nullptr)
+            if (cfg->inputPaths.empty())
             {
                 cfg->seekTime = argv[++i];
             }
@@ -769,7 +764,7 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
 static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
 {
     int i = 1;
-    cfg->inputPath = argv[i++];
+    cfg->inputPaths.push_back(argv[i++]);
     cfg->outputPath = argv[i++];
 
     for (; i < argc; ++i)

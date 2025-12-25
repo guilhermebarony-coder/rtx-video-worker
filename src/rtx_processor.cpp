@@ -254,6 +254,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
                               /*bt2020=*/true, // Always use BT.2020 for HDR content
                               m_stream);
 
+        cudaStreamSynchronize(m_stream);
         return true;
     }
 
@@ -363,43 +364,25 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
 
     // VSR and/or THDR enabled: need to go through RTX processing
     // Step 1: P010 (10-bit SDR padded) -> NV12 (8-bit) to extract actual 8-bit data
-    // We need temporary NV12 buffers on device at source resolution
-    uint8_t *d_tempY = nullptr;
-    uint8_t *d_tempUV = nullptr;
-    size_t tempPitchY = 0, tempPitchUV = 0;
-
-    // Allocate temporary NV12 buffers (source resolution)
-    cudaError_t err1 = cudaMallocPitch(&d_tempY, &tempPitchY, m_srcW, m_srcH);
-    cudaError_t err2 = cudaMallocPitch(&d_tempUV, &tempPitchUV, m_srcW, m_srcH / 2);
-    if (err1 != cudaSuccess || err2 != cudaSuccess || !d_tempY || !d_tempUV)
+    // Use pre-allocated temporary NV12 buffers (avoids per-frame allocation overhead)
+    if (!m_devTempY || !m_devTempUV)
     {
-        if (d_tempY)
-            cudaFree(d_tempY);
-        if (d_tempUV)
-            cudaFree(d_tempUV);
-        setError("processGpuP010ToNV12: failed to allocate temp NV12 buffers");
+        setError("processGpuP010ToNV12: temp NV12 buffers not allocated");
         return false;
     }
 
     // Downsample P010 → NV12 (extract 8-bit SDR data)
     launch_p010_to_nv12(d_y, pitchY, d_uv, pitchUV,
-                        d_tempY, (int)tempPitchY, d_tempUV, (int)tempPitchUV,
+                        m_devTempY, (int)m_devTempYPitch, m_devTempUV, (int)m_devTempUVPitch,
                         (int)m_srcW, (int)m_srcH,
                         m_stream);
 
     // Step 2: NV12 (8-bit SDR) -> BGRA8 (device pitched)
-    launch_nv12_to_bgra(d_tempY, (int)tempPitchY, d_tempUV, (int)tempPitchUV,
+    launch_nv12_to_bgra(m_devTempY, (int)m_devTempYPitch, m_devTempUV, (int)m_devTempUVPitch,
                         m_devBGRA, (int)m_devBGRAPitch,
                         (int)m_srcW, (int)m_srcH,
                         false, // bt2020 = false for SDR
                         m_stream);
-
-    // Synchronize before freeing temp buffers to ensure kernels have finished reading from them
-    cudaStreamSynchronize(m_stream);
-
-    // Free temporary buffers (safe now that kernels are complete)
-    cudaFree(d_tempY);
-    cudaFree(d_tempUV);
 
     // Step 3: Copy BGRA8 (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
@@ -464,25 +447,15 @@ bool RTXProcessor::processGpuP010SDRToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
     // Step 1: P010 → NV12 (extract 8-bit SDR)
-    // Allocate temporary NV12 buffers at source resolution
-    uint8_t *d_tempY = nullptr;
-    uint8_t *d_tempUV = nullptr;
-    size_t tempPitchY = 0, tempPitchUV = 0;
-
-    cudaError_t err1 = cudaMallocPitch(&d_tempY, &tempPitchY, m_srcW, m_srcH);
-    cudaError_t err2 = cudaMallocPitch(&d_tempUV, &tempPitchUV, m_srcW, m_srcH / 2);
-    if (err1 != cudaSuccess || err2 != cudaSuccess || !d_tempY || !d_tempUV)
+    // Use pre-allocated temporary NV12 buffers (avoids per-frame allocation overhead)
+    if (!m_devTempY || !m_devTempUV)
     {
-        if (d_tempY)
-            cudaFree(d_tempY);
-        if (d_tempUV)
-            cudaFree(d_tempUV);
-        setError("processGpuP010SDRToP010: failed to allocate temp NV12 buffers");
+        setError("processGpuP010SDRToP010: temp NV12 buffers not allocated");
         return false;
     }
 
     launch_p010_to_nv12(d_y, pitchY, d_uv, pitchUV,
-                        d_tempY, (int)tempPitchY, d_tempUV, (int)tempPitchUV,
+                        m_devTempY, (int)m_devTempYPitch, m_devTempUV, (int)m_devTempUVPitch,
                         (int)m_srcW, (int)m_srcH,
                         m_stream);
 
@@ -491,17 +464,11 @@ bool RTXProcessor::processGpuP010SDRToP010(const uint8_t *d_y, int pitchY,
     cudaStreamSynchronize(m_stream);
 
     // Step 2: NV12 → BGRA8 → RTX (VSR+THDR) → ABGR10 → P010
-    // Reuse the NV12ToP010 logic by calling it with the temp NV12 buffers
-    bool result = processGpuNV12ToP010(d_tempY, (int)tempPitchY,
-                                       d_tempUV, (int)tempPitchUV,
-                                       encP010Frame,
-                                       false); // bt2020=false for SDR input
-
-    // Note: processGpuNV12ToP010 already synchronizes at the end, so temp buffers are safe to free
-    cudaFree(d_tempY);
-    cudaFree(d_tempUV);
-
-    return result;
+    // Reuse the NV12ToP010 logic by calling it with the pre-allocated temp NV12 buffers
+    return processGpuNV12ToP010(m_devTempY, (int)m_devTempYPitch,
+                                m_devTempUV, (int)m_devTempUVPitch,
+                                encP010Frame,
+                                false); // bt2020=false for SDR input
 }
 
 bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
@@ -657,6 +624,20 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
         return false;
     }
     m_devABGR10Pitch = pitch;
+
+    // Pre-allocate temporary NV12 buffers for P010->NV12 conversion (avoids per-frame allocation)
+    if (cudaMallocPitch(&m_devTempY, &pitch, m_srcW, m_srcH) != cudaSuccess)
+    {
+        setError("cudaMallocPitch m_devTempY failed");
+        return false;
+    }
+    m_devTempYPitch = pitch;
+    if (cudaMallocPitch(&m_devTempUV, &pitch, m_srcW, m_srcH / 2) != cudaSuccess)
+    {
+        setError("cudaMallocPitch m_devTempUV failed");
+        return false;
+    }
+    m_devTempUVPitch = pitch;
 
     m_initialized = true;
     return true;
@@ -870,6 +851,18 @@ void RTXProcessor::freeSurfaces()
         cudaFree(m_devABGR10);
         m_devABGR10 = nullptr;
         m_devABGR10Pitch = 0;
+    }
+    if (m_devTempY)
+    {
+        cudaFree(m_devTempY);
+        m_devTempY = nullptr;
+        m_devTempYPitch = 0;
+    }
+    if (m_devTempUV)
+    {
+        cudaFree(m_devTempUV);
+        m_devTempUV = nullptr;
+        m_devTempUVPitch = 0;
     }
 
     if (m_ctx)

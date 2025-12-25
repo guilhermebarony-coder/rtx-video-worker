@@ -33,6 +33,26 @@ inline std::string ff_ts(double seconds)
     return b;
 }
 
+// Ensure DTS monotonicity for muxer compatibility (MP4 requires strictly increasing DTS)
+// Updates packet DTS if needed and ensures PTS >= DTS. Updates last_dts tracking variable.
+inline void ensure_dts_monotonicity(AVPacket *pkt, int64_t &last_dts)
+{
+    if (last_dts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE)
+    {
+        int64_t min_dts = last_dts + 1;
+        if (pkt->dts < min_dts)
+        {
+            pkt->dts = min_dts;
+            // Ensure PTS >= DTS after adjustment
+            if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < pkt->dts)
+            {
+                pkt->pts = pkt->dts;
+            }
+        }
+    }
+    last_dts = pkt->dts;
+}
+
 // Attach HDR mastering metadata and content light level side data to a video stream
 // Used for SDR→HDR (THDR) to generate synthetic metadata
 void add_mastering_and_cll(AVStream *st, int max_luminance_nits);

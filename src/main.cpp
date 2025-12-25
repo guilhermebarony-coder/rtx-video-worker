@@ -103,22 +103,7 @@ static inline void encode_and_write(AVCodecContext *enc,
         // NVENC generates duplicate DTS at GOP boundaries with forced-idr + strict_gop (HLS alignment).
         // This is standard FFmpeg behavior - the CLI tool applies the same correction before muxing.
         // Without this, HLS muxer fails with "non monotonically increasing dts" errors.
-        if (out.last_video_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
-        {
-            int64_t max_dts = out.last_video_dts + 1; // Minimum acceptable DTS
-            if (opkt->dts < max_dts)
-            {
-                LOG_DEBUG("DTS monotonicity: adjusting packet DTS from %lld to %lld", opkt->dts, max_dts);
-                opkt->dts = max_dts;
-
-                // Ensure PTS >= DTS after adjustment (FFmpeg requirement)
-                if (opkt->pts != AV_NOPTS_VALUE && opkt->pts < opkt->dts)
-                {
-                    opkt->pts = opkt->dts;
-                }
-            }
-        }
-        out.last_video_dts = opkt->dts;
+        ensure_dts_monotonicity(opkt.get(), out.last_video_dts);
 
         ff_check(av_interleaved_write_frame(ofmt, opkt.get()), "write video packet");
         av_packet_unref(opkt.get());
@@ -330,7 +315,7 @@ int run_pipeline(PipelineConfig cfg)
     }
 
     LOG_VERBOSE("Starting video processing pipeline");
-    LOG_DEBUG("Input: %s", cfg.inputPath);
+    LOG_DEBUG("Input: %s", cfg.inputPaths.empty() ? "(none)" : cfg.inputPaths[0].c_str());
     LOG_DEBUG("Output: %s", cfg.outputPath);
     LOG_VERBOSE("CPU-only mode: %s", cfg.cpuOnly ? "enabled" : "disabled");
 
@@ -351,7 +336,7 @@ int run_pipeline(PipelineConfig cfg)
         inputOpts.enableErrorConcealment = !cfg.ffCompatible; // FFmpeg doesn't enable error concealment by default
 
         inputOpts.flushOnSeek = false; // FFmpeg never flushes decoder on seek
-        open_input(cfg.inputPath, in, &inputOpts);
+        open_input(cfg.inputPaths.empty() ? nullptr : cfg.inputPaths[0].c_str(), in, &inputOpts);
         bool inputIsHDR = configure_input_hdr_detection(cfg, in);
 
         // Pass HDR detection to RTX config for proper pipeline selection
@@ -419,7 +404,6 @@ int run_pipeline(PipelineConfig cfg)
         auto start_time = std::chrono::high_resolution_clock::now();
         auto last_update = start_time;
         const int update_interval_ms = 500; // Update progress every 500ms
-        std::string progress_bar(50, ' ');
 
         // Prepare sws contexts (created on first decoded frame when actual format is known)
 
@@ -476,7 +460,12 @@ int run_pipeline(PipelineConfig cfg)
         uint32_t rtxW = 0, rtxH = 0;
         size_t rtxPitch = 0;
 
-        // Progress display function
+        // Progress display function - pre-allocate reusable buffers to avoid per-frame allocations
+        constexpr int bar_width = 50;
+        std::string progress_bar;
+        progress_bar.reserve(bar_width + 10);
+        std::ostringstream progress_oss;
+
         auto show_progress = [&]()
         {
             if (total_frames <= 0)
@@ -492,22 +481,21 @@ int run_pipeline(PipelineConfig cfg)
             last_update = now;
 
             double progress = static_cast<double>(processed_frames) / total_frames;
-            int bar_width = 50;
             int pos = static_cast<int>(bar_width * progress);
 
-            std::string bar;
-            bar.reserve(bar_width + 10);
-            bar = "[";
+            // Reuse pre-allocated string buffer
+            progress_bar.clear();
+            progress_bar = "[";
             for (int i = 0; i < bar_width; ++i)
             {
                 if (i < pos)
-                    bar += "=";
+                    progress_bar += "=";
                 else if (i == pos)
-                    bar += ">";
+                    progress_bar += ">";
                 else
-                    bar += " ";
+                    progress_bar += " ";
             }
-            bar += "] ";
+            progress_bar += "] ";
 
             // Calculate FPS
             double fps = (elapsed_ms > 0) ? (processed_frames * 1000.0) / elapsed_ms : 0.0;
@@ -517,28 +505,28 @@ int run_pipeline(PipelineConfig cfg)
             int remaining_mins = static_cast<int>(remaining_sec) / 60;
             int remaining_secs = static_cast<int>(remaining_sec) % 60;
 
-            // Format progress line
-            std::ostringstream oss;
+            // Format progress line - reuse pre-allocated ostringstream
+            progress_oss.str("");
+            progress_oss.clear();
             if (!cfg.ffCompatible)
-                oss << "\r";
-            oss << bar;
-            oss << std::setw(5) << std::fixed << std::setprecision(1) << (progress * 100.0) << "% ";
-            oss << "[" << processed_frames << "/" << total_frames << "] ";
-            oss << std::setw(5) << std::fixed << std::setprecision(1) << fps << " fps ";
-            oss << "ETA: " << std::setw(2) << std::setfill('0') << remaining_mins << ":"
+                progress_oss << "\r";
+            progress_oss << progress_bar;
+            progress_oss << std::setw(5) << std::fixed << std::setprecision(1) << (progress * 100.0) << "% ";
+            progress_oss << "[" << processed_frames << "/" << total_frames << "] ";
+            progress_oss << std::setw(5) << std::fixed << std::setprecision(1) << fps << " fps ";
+            progress_oss << "ETA: " << std::setw(2) << std::setfill('0') << remaining_mins << ":"
                 << std::setw(2) << std::setfill('0') << remaining_secs;
 
             // Clear the line and print
             if (!cfg.ffCompatible)
             {
                 fprintf(stderr, "\r\033[2K"); // Clear the entire line and move cursor to start
-                fprintf(stderr, "%s", oss.str().c_str());
+                fprintf(stderr, "%s", progress_oss.str().c_str());
             }
             else
             {
                 // In FFmpeg-compatible mode, avoid backspacing/clearing; print each update on a new line
-                std::string line = oss.str();
-                fprintf(stderr, "%s\n", line.c_str());
+                fprintf(stderr, "%s\n", progress_oss.str().c_str());
             }
             fflush(stderr);
         };
@@ -1170,17 +1158,7 @@ int run_pipeline(PipelineConfig cfg)
                             av_packet_rescale_ts(opkt.get(), enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
 
                             // DTS monotonicity fix for audio flush packets
-                            if (enc_ctx.last_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
-                            {
-                                int64_t min_dts = enc_ctx.last_dts + 1;
-                                if (opkt->dts < min_dts)
-                                {
-                                    opkt->dts = min_dts;
-                                    if (opkt->pts != AV_NOPTS_VALUE && opkt->pts < opkt->dts)
-                                        opkt->pts = opkt->dts;
-                                }
-                            }
-                            enc_ctx.last_dts = opkt->dts;
+                            ensure_dts_monotonicity(opkt.get(), enc_ctx.last_dts);
 
                             av_interleaved_write_frame(out.fmt, opkt.get());
                             av_packet_unref(opkt.get());
@@ -1201,17 +1179,7 @@ int run_pipeline(PipelineConfig cfg)
                         av_packet_rescale_ts(opkt.get(), enc_ctx.encoder->time_base, enc_ctx.output_stream->time_base);
 
                         // DTS monotonicity fix for audio flush packets
-                        if (enc_ctx.last_dts != AV_NOPTS_VALUE && opkt->dts != AV_NOPTS_VALUE)
-                        {
-                            int64_t min_dts = enc_ctx.last_dts + 1;
-                            if (opkt->dts < min_dts)
-                            {
-                                opkt->dts = min_dts;
-                                if (opkt->pts != AV_NOPTS_VALUE && opkt->pts < opkt->dts)
-                                    opkt->pts = opkt->dts;
-                            }
-                        }
-                        enc_ctx.last_dts = opkt->dts;
+                        ensure_dts_monotonicity(opkt.get(), enc_ctx.last_dts);
 
                         av_interleaved_write_frame(out.fmt, opkt.get());
                         av_packet_unref(opkt.get());

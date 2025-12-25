@@ -9,6 +9,7 @@ extern "C"
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#include <cuda_runtime.h>
 
 // RAII deleter helpers
 static inline void av_frame_free_single_fp(AVFrame *f)
@@ -27,8 +28,10 @@ public:
 
     // hw_frames_ctx: encoder's CUDA frames context (AV_PIX_FMT_CUDA with sw_format P010)
     // width/height are for clarity; frames will inherit from hw_frames_ctx
-    void initialize(AVBufferRef *hw_frames_ctx, int width, int height, int pool_size)
+    // stream: CUDA stream to synchronize on (use the RTX processor's stream for proper sync)
+    void initialize(AVBufferRef *hw_frames_ctx, int width, int height, int pool_size, cudaStream_t stream = nullptr)
     {
+        m_stream = stream;
         if (!hw_frames_ctx)
             throw std::runtime_error("CudaFramePool: hw_frames_ctx is null");
         m_hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
@@ -67,9 +70,9 @@ public:
         if (m_frames.empty())
             throw std::runtime_error("CudaFramePool not initialized");
 
-        // Sync default stream before reuse to ensure encoder finished with previous frame
-        // Conservative: prevents race when pool wraps around (encoder async_depth)
-        cudaStreamSynchronize(0);
+        // Sync the processing stream before reuse to ensure encoder finished with previous frame
+        // This prevents race conditions when pool wraps around (encoder async_depth)
+        cudaStreamSynchronize(m_stream);
 
         FramePtr &slot = m_frames[m_index];
         m_index = (m_index + 1) % m_frames.size();
@@ -86,4 +89,5 @@ private:
     AVBufferRef *m_hw_frames_ctx = nullptr;
     std::vector<FramePtr> m_frames;
     size_t m_index = 0;
+    cudaStream_t m_stream = nullptr;  // CUDA stream for synchronization
 };

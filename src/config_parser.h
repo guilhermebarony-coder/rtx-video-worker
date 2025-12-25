@@ -13,7 +13,6 @@ struct PipelineConfig
     bool cpuOnly = false;
     bool ffCompatible = false;
 
-    char *inputPath = nullptr; // DEPRECATED: Use inputPaths for multi-input support
     char *outputPath = nullptr;
 
     // Multi-input support

@@ -159,6 +159,12 @@ private:
     uint8_t *m_devABGR10 = nullptr; // dstW x dstH x 4, pitched
     size_t m_devABGR10Pitch = 0;
 
+    // Pre-allocated temporary NV12 buffers for P010->NV12 conversion (avoids per-frame allocation)
+    uint8_t *m_devTempY = nullptr;   // srcW x srcH, pitched
+    size_t m_devTempYPitch = 0;
+    uint8_t *m_devTempUV = nullptr;  // srcW x (srcH/2), pitched
+    size_t m_devTempUVPitch = 0;
+
     // Host staging
     std::vector<uint8_t> m_hostOut; // ABGR10 output when THDR enabled, BGRA8 otherwise
 
