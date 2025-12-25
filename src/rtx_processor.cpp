@@ -225,8 +225,11 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
     // 1) P010 (device) -> X2BGR10LE (10-bit RGB, device pitched) - preserving full 10-bit precision
+    // IMPORTANT: Use m_devBGRA (source-sized buffer) for input conversion, NOT m_devABGR10 (dest-sized).
+    // Using dest-sized buffer for source data causes overlay artifacts when VSR upscales,
+    // because the source data only fills a portion of the buffer and stale data remains.
     launch_p010_to_x2bgr10(d_y, pitchY, d_uv, pitchUV,
-                           m_devABGR10, (int)m_devABGR10Pitch, // Reuse ABGR10 buffer for X2BGR10LE
+                           m_devBGRA, (int)m_devBGRAPitch, // Use source-sized buffer
                            (int)m_srcW, (int)m_srcH,
                            bt2020,
                            m_stream);
@@ -244,7 +247,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
             return false;
         }
         // Direct X2BGR10LE -> P010 preserving 10-bit precision with BT.2020 colorspace
-        launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
+        launch_abgr10_to_p010(m_devBGRA, (int)m_devBGRAPitch,
                               d_outY, pitchOutY,
                               d_outUV, pitchOutUV,
                               (int)m_srcW, (int)m_srcH,
@@ -257,8 +260,8 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     // 2) Copy X2BGR10LE (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
     copyIn.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-    copyIn.srcDevice = (CUdeviceptr)m_devABGR10; // Source is now X2BGR10LE
-    copyIn.srcPitch = (unsigned int)m_devABGR10Pitch;
+    copyIn.srcDevice = (CUdeviceptr)m_devBGRA; // Source-sized X2BGR10LE buffer
+    copyIn.srcPitch = (unsigned int)m_devBGRAPitch;
     copyIn.dstMemoryType = CU_MEMORYTYPE_ARRAY;
     copyIn.dstArray = m_srcArray;
     copyIn.WidthInBytes = (unsigned int)(m_srcW * 4); // 4 bytes per pixel for X2BGR10LE
