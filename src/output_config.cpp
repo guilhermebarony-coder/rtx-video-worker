@@ -14,17 +14,6 @@ extern "C"
 #include <libavutil/mastering_display_metadata.h>
 }
 
-// Check if output is a pipe/stdout
-bool is_pipe_output(const char *path)
-{
-    if (!path)
-        return false;
-    return (std::strcmp(path, "-") == 0) ||
-           (std::strcmp(path, "pipe:") == 0) ||
-           (std::strcmp(path, "pipe:1") == 0) ||
-           (std::strncmp(path, "pipe:", 5) == 0);
-}
-
 // Check if HLS output will be used
 bool will_use_hls_output(const PipelineConfig &cfg)
 {
@@ -61,10 +50,6 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
             return;
         }
     }
-
-    // Output format is HLS
-    if (cfg->outputFormatName.empty())
-        cfg->outputFormatName = "hls";
 
     hlsOpts.enabled = true;
     hlsOpts.overwrite = cfg->overwrite;
@@ -110,7 +95,7 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     }
     else
     {
-        const std::string segmentExt = useFmp4 ? ".mp4" : ".ts";
+        const std::string segmentExt = useFmp4 ? ".m4s" : ".ts";
         const std::string pattern = playlistStem.empty() ? (std::string("segment_%05d") + segmentExt)
                                                          : (playlistStem + "_%05d" + segmentExt);
         std::filesystem::path segPath = playlistDir.empty() ? std::filesystem::path(pattern) : (playlistDir / pattern);
@@ -154,20 +139,67 @@ void finalize_hls_options(PipelineConfig *cfg, OutputContext *out)
     hlsOpts.customFlags = cfg->hlsFlags;
     hlsOpts.segmentOptions = cfg->hlsSegmentOptions;
 
-    // HLS fMP4 + copyts + avoid_negative_ts disabled requires segment muxer override
-    // Segment muxers inherit avoid_negative_ts=disabled, causing large timestamps in tfdt boxes
-    // With synchronized A/V timestamps (audio now uses copyts too), we still need normalization
-    // to prevent hls.js from rejecting tfdt values
-    if (useFmp4 && cfg->copyts && cfg->avoidNegativeTs == "disabled")
-    {
-        if (!hlsOpts.segmentOptions.empty())
-            hlsOpts.segmentOptions += ":avoid_negative_ts=make_zero";
-        else
-            hlsOpts.segmentOptions = "avoid_negative_ts=make_zero";
-        LOG_INFO("HLS: Injected avoid_negative_ts=make_zero into segment options for tfdt normalization");
+    out->hlsOptions = hlsOpts;
+}
+
+// Calculate smart bitrate based on codec, features, and config
+static int64_t calculate_smart_bitrate(const InputContext &in, const PipelineConfig &cfg, bool inputIsHDR)
+{
+    // Check for user override
+    if (cfg.targetBitrate > 0) {
+        LOG_VERBOSE("Using user-specified bitrate: %.2f Mbps", cfg.targetBitrate / 1000000.0);
+        return cfg.targetBitrate;
     }
 
-    out->hlsOptions = hlsOpts;
+    // Detect input codec
+    bool is_h265 = (in.vst->codecpar->codec_id == AV_CODEC_ID_HEVC ||
+                    in.vst->codecpar->codec_id == AV_CODEC_ID_H265);
+
+    // Check features
+    bool has_upscale = cfg.rtxCfg.enableVSR;
+    bool has_thdr = cfg.rtxCfg.enableTHDR;
+
+    // Base multiplier from config
+    double multiplier = cfg.targetBitrateMultiplier;
+
+    // Apply codec and feature-aware scaling
+    double feature_scale = 1.0;
+    if (has_upscale && has_thdr) {
+        feature_scale = is_h265 ? 1.5 : 2.0;
+    } else if (has_upscale) {
+        feature_scale = is_h265 ? 1.2 : 1.5;
+    } else if (has_thdr) {
+        feature_scale = is_h265 ? 1.1 : 1.3;
+    } else {
+        feature_scale = is_h265 ? 0.8 : 1.0;
+    }
+
+    multiplier *= feature_scale;
+
+    // HDR input adjustment
+    if (inputIsHDR) {
+        multiplier *= 0.8;
+    }
+
+    // Calculate target bitrate
+    int64_t input_bitrate = in.fmt->bit_rate;
+    int64_t target_bitrate;
+
+    if (input_bitrate > 0) {
+        target_bitrate = (int64_t)(input_bitrate * multiplier);
+    } else {
+        target_bitrate = 25000000; // 25 Mbps fallback
+    }
+
+    // Detailed logging
+    LOG_VERBOSE("Bitrate calc: codec=%s, upscale=%d, thdr=%d, inputHDR=%d",
+                is_h265 ? "H265" : "H264/other", has_upscale, has_thdr, inputIsHDR);
+    LOG_VERBOSE("  base_mult=%.2f, feature_scale=%.2f, final_mult=%.2f",
+                (double)cfg.targetBitrateMultiplier, feature_scale, multiplier);
+    LOG_VERBOSE("  input=%.2f Mbps, target=%.2f Mbps",
+                input_bitrate / 1000000.0, target_bitrate / 1000000.0);
+
+    return target_bitrate;
 }
 
 // Configure video encoder
@@ -181,10 +213,32 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     out.venc->height = dstH;
 
     // Encoder timebase configuration:
-    // - HLS: Use framerate-based timebase (already set in ffmpeg_utils.cpp as 1/fps)
-    //        This matches vanilla FFmpeg behavior and ensures HLS muxer uses 1/24000
-    // - Non-HLS: Use input stream timebase for -copyts compatibility (-enc_time_base -1)
-    if (!hls_enabled)
+    // Priority: If CFR is enabled, use 1/fr so encoder emits timestamps in CFR ticks.
+    // Otherwise: HLS keeps framerate-based TB (set earlier), Non-HLS uses input stream TB for -copyts compat.
+    bool cfr_enabled = (cfg.vsync == "cfr" || cfg.vsync == "0");
+    if (cfr_enabled)
+    {
+        // Prefer input timebase if it produces an integer ticks-per-frame for CFR
+        // Condition: (tb_den * fr.den) % fr.num == 0
+        int tb_den = in.vst->time_base.den;
+        if (tb_den > 0 && ( (int64_t)tb_den * fr.den ) % fr.num == 0)
+        {
+            out.venc->time_base = in.vst->time_base;
+            out.vstream->time_base = out.venc->time_base;
+            int64_t tpf = ((int64_t)tb_den * fr.den) / fr.num;
+            LOG_INFO("CFR: Using input timebase %d/%d with ticks_per_frame=%lld", out.venc->time_base.num, out.venc->time_base.den, (long long)tpf);
+        }
+        else
+        {
+            // Fallback: integer timescale so each frame maps to an exact integer number of ticks
+            // For fr=num/den, choose timescale=num*den and ticks_per_frame=den*den (exact integer)
+            int64_t timescale = (int64_t)fr.num * fr.den;
+            out.venc->time_base = {1, (int)timescale};
+            out.vstream->time_base = out.venc->time_base;
+            LOG_INFO("CFR: Using integer timescale, encoder/stream time_base %d/%d", out.venc->time_base.num, out.venc->time_base.den);
+        }
+    }
+    else if (!hls_enabled)
     {
         // Non-HLS: Override to use input stream timebase
         out.venc->time_base = in.vst->time_base;
@@ -194,8 +248,7 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     }
     else
     {
-        // HLS: Keep the framerate-based timebase that was set in ffmpeg_utils.cpp
-        // This ensures muxer will use 1/24000 (or similar) instead of 1/16000
+        // HLS without CFR: Keep the framerate-based timebase (set earlier)
         LOG_INFO("HLS: Using framerate-based encoder timebase %d/%d",
                  out.venc->time_base.num, out.venc->time_base.den);
     }
@@ -212,17 +265,32 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     }
 
     // For HLS, align GOP with segment duration
+    // If -g was used (gopFrames >= 0), use frames directly; otherwise convert seconds to frames
     int gop_duration_sec = cfg.gop;
-    int gop_size_frames = cfg.gop * fr.num / std::max(1, fr.den);
+    int gop_size_frames;
 
-    if (hls_enabled && out.hlsOptions.hlsTime > 0)
+    if (cfg.gopFrames >= 0)
+    {
+        // FFmpeg-compatible -g flag was used (GOP in frames)
+        gop_size_frames = cfg.gopFrames;
+        gop_duration_sec = (int)((double)gop_size_frames * fr.den / fr.num);
+    }
+    else
+    {
+        // --nvenc-gop was used (GOP in seconds)
+        gop_size_frames = cfg.gop * fr.num / std::max(1, fr.den);
+    }
+
+    if (hls_enabled && out.hlsOptions.hlsTime > 0 && cfg.gopFrames < 0)
     {
         gop_duration_sec = out.hlsOptions.hlsTime;
 
-        // Calculate GOP size with proper rounding for fractional framerates
-        // For 23.976fps (24000/1001): 3 * 24000 / 1001 = 71.928 → round to 72
-        gop_size_frames = (int)round((double)gop_duration_sec * fr.num / fr.den);
+        // Calculate GOP size using integer rescaling for precision
+        // For 23.976fps (24000/1001): av_rescale(3, 24000, 1001) = 72
+        // Formula: (duration_sec * framerate.num + framerate.den/2) / framerate.den
+        gop_size_frames = av_rescale(gop_duration_sec, fr.num, fr.den);
 
+        // Calculate FPS for warning message (display only, not used in timestamp calculations)
         double fps = (double)fr.num / fr.den;
         if (fps > 50 && gop_duration_sec > 2)
         {
@@ -239,13 +307,10 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     out.venc->max_b_frames = cfg.bframes;
     out.venc->color_range = AVCOL_RANGE_MPEG;
 
-    // For HLS: Set minimum keyframe interval equal to GOP size
-    // This matches FFmpeg's -keyint_min behavior and ensures strict GOP alignment
-    if (hls_enabled)
-    {
-        av_opt_set_int(out.venc->priv_data, "g", gop_size_frames, 0);
-        // Note: NVENC doesn't have keyint_min, but strict_gop below achieves the same
-    }
+    // For NVENC: gop_size set above is sufficient
+    // Setting both AVCodecContext->gop_size and the "g" private option can cause conflicts
+    // The NVENC encoder will use the gop_size field directly
+    // Note: forced-idr and strict_gop below ensure HLS segment alignment
 
     // HDR color settings
     if (outputHDR)
@@ -275,22 +340,106 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
         out.venc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    int64_t target_bitrate = (in.fmt->bit_rate > 0) ? (int64_t)(in.fmt->bit_rate * cfg.targetBitrateMultiplier) : (int64_t)25000000;
-    LOG_VERBOSE("Input bitrate: %.2f (Mbps), Target bitrate: %.2f (Mbps)\n", in.fmt->bit_rate / 1000000.0, target_bitrate / 1000000.0);
-    LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d, bframes: %d",
-                cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, cfg.bframes);
+    int64_t target_bitrate = calculate_smart_bitrate(in, cfg, inputIsHDR);
+    if (cfg.gopFrames >= 0)
+    {
+        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d frames (via -g), bframes: %d",
+                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, gop_size_frames, cfg.bframes);
+    }
+    else
+    {
+        LOG_VERBOSE("Encoder settings - tune: %s, preset: %s, rc: %s, qp: %d, gop: %d sec (%d frames), bframes: %d",
+                    cfg.tune.c_str(), cfg.preset.c_str(), cfg.rc.c_str(), cfg.qp, cfg.gop, gop_size_frames, cfg.bframes);
+    }
 
     av_opt_set(out.venc->priv_data, "tune", cfg.tune.c_str(), 0);
     av_opt_set(out.venc->priv_data, "preset", cfg.preset.c_str(), 0);
     av_opt_set(out.venc->priv_data, "rc", cfg.rc.c_str(), 0);
     av_opt_set_int(out.venc->priv_data, "qp", cfg.qp, 0);
-    av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
 
-    if (hls_enabled)
+    // Apply bitrate to encoder (required for CBR/VBR)
+    out.venc->bit_rate = target_bitrate;
+
+    // CBR/VBR specific settings
+    if (cfg.rc == "cbr") {
+        // CBR: fixed bitrate, maxrate = bitrate
+        av_opt_set_int(out.venc->priv_data, "maxrate", target_bitrate, 0);
+        int64_t bufsize = target_bitrate * 2;
+        av_opt_set_int(out.venc->priv_data, "bufsize", bufsize, 0);
+        LOG_VERBOSE("CBR: bitrate=%.2f Mbps, bufsize=%.2f Mbps",
+                    target_bitrate / 1000000.0, bufsize / 1000000.0);
+    } else if (cfg.rc == "vbr" || cfg.rc == "vbr_hq") {
+        // VBR: target bitrate (avg) + maxrate (peak)
+        int64_t maxrate;
+        if (cfg.maxBitrate > 0) {
+            maxrate = cfg.maxBitrate;
+        } else {
+            maxrate = (int64_t)(target_bitrate * 3.0);  // Default: 3x for quality
+        }
+
+        // Validate maxrate >= target
+        if (maxrate < target_bitrate) {
+            LOG_WARN("VBR maxrate (%.2f Mbps) < target (%.2f Mbps), adjusting to target",
+                     maxrate / 1000000.0, target_bitrate / 1000000.0);
+            maxrate = target_bitrate;
+        }
+
+        int64_t bufsize = maxrate * 2;
+        av_opt_set_int(out.venc->priv_data, "maxrate", maxrate, 0);
+        av_opt_set_int(out.venc->priv_data, "bufsize", bufsize, 0);
+
+        double variance_pct = ((double)(maxrate - target_bitrate) / target_bitrate) * 100.0;
+        LOG_VERBOSE("VBR: target=%.2f Mbps, maxrate=%.2f Mbps (+%.1f%%), bufsize=%.2f Mbps",
+                    target_bitrate / 1000000.0, maxrate / 1000000.0, variance_pct, bufsize / 1000000.0);
+
+        if (variance_pct > 100.0) {
+            LOG_WARN("VBR variance high (+%.1f%%), bitrate may spike. Use --nvenc-maxrate to limit.", variance_pct);
+        }
+    }
+    // CQP mode ignores bitrate, uses QP instead
+
+    av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+    // Reduced from 4 to 2 for better VRAM efficiency (supports 4K→8K upscaling within 12GB VRAM)
+    av_opt_set_int(out.venc->priv_data, "async_depth", 2, 0);
+    // Reduced from 8 to 4 to halve lookahead memory usage while maintaining quality benefits
+    av_opt_set_int(out.venc->priv_data, "rc-lookahead", 4, 0);
+
+    // Apply advanced keyframe control options
+    if (cfg.scThreshold >= 0)
+    {
+        // Note: sc_threshold is primarily for x264/x265, NVENC may ignore it
+        av_opt_set_int(out.venc->priv_data, "sc_threshold", cfg.scThreshold, 0);
+        LOG_VERBOSE("Set sc_threshold=%d (x264/x265 only, NVENC may ignore)", cfg.scThreshold);
+    }
+
+    if (cfg.keyintMin >= 0)
+    {
+        av_opt_set_int(out.venc->priv_data, "keyint_min", cfg.keyintMin, 0);
+        LOG_VERBOSE("Set keyint_min=%d frames", cfg.keyintMin);
+    }
+
+    // Apply no-scenecut if explicitly requested OR for HLS mode
+    if (cfg.noScenecut || hls_enabled)
+    {
+        av_opt_set(out.venc->priv_data, "no-scenecut", "1", 0);
+        LOG_VERBOSE("Set no-scenecut=1 (disables adaptive I-frame insertion)");
+    }
+
+    // Apply forced-idr if explicitly requested OR for HLS mode
+    if (cfg.forcedIdr || hls_enabled)
     {
         av_opt_set(out.venc->priv_data, "forced-idr", "1", 0);
+        LOG_VERBOSE("Set forced-idr=1 (forces IDR frames at GOP boundaries)");
+    }
+
+    // HLS-specific: always enable strict_gop for segment alignment
+    if (hls_enabled)
+    {
         av_opt_set(out.venc->priv_data, "strict_gop", "1", 0);
-        LOG_INFO("Enabled forced-idr + strict_gop for HLS segment alignment (ensures I-frame at every segment boundary)");
+        LOG_INFO("HLS: GOP size=%d frames (%.2f sec), forced-idr=1, strict_gop=1, no-scenecut=1",
+                 gop_size_frames, (double)gop_size_frames * fr.den / fr.num);
+        LOG_INFO("Expected: I-frame every %d frames, P/B-frames in between (max_b_frames=%d)",
+                 gop_size_frames, cfg.bframes);
     }
 
     if (outputHDR)
@@ -313,7 +462,10 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
         fctx->sw_format = outputHDR ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
         fctx->width = dstW;
         fctx->height = dstH;
-        fctx->initial_pool_size = 64;
+        // Optimized pool size for VRAM efficiency (reduced from 96 to 32)
+        // Balanced for all resolutions: keeps 8K encoding under 8GB VRAM budget
+        // 32 frames @ 8K (7680x4320 P010) = ~3.2GB, @ 4K = ~800MB
+        fctx->initial_pool_size = 32;
         ff_check(av_hwframe_ctx_init(enc_hw_frames), "init encoder hwframe ctx");
         out.venc->hw_frames_ctx = av_buffer_ref(enc_hw_frames);
     }
@@ -382,11 +534,22 @@ void configure_stream_metadata(InputContext &in, OutputContext &out, PipelineCon
     {
         if (inputIsHDR)
         {
+            // HDR→HDR passthrough: Preserve original mastering display metadata
             LOG_INFO("Preserving HDR mastering metadata from input stream");
-            add_mastering_and_cll(out.vstream, 4000);
+            bool metadata_preserved = copy_stream_hdr_metadata(in.vst, out.vstream);
+
+            // Fallback: If no metadata found in input, generate conservative defaults
+            if (!metadata_preserved)
+            {
+                LOG_WARN("HDR input lacks mastering metadata, generating conservative defaults");
+                add_mastering_and_cll(out.vstream, 4000);
+            }
         }
         else
         {
+            // SDR→HDR (THDR): Generate synthetic metadata based on tone mapping target
+            LOG_INFO("Generating HDR mastering metadata for THDR tone mapping (target: %d nits)",
+                     cfg.rtxCfg.thdrMaxLuminance);
             add_mastering_and_cll(out.vstream, cfg.rtxCfg.thdrMaxLuminance);
         }
     }

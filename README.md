@@ -9,11 +9,12 @@ A high-performance CLI tool that applies **NVIDIA RTX Video Super Resolution (VS
 - 📺 **HLS Streaming**: Native HLS output with fMP4 or MPEGTS segments
 - 🌐 **Network Streaming**: Supports HTTP/HTTPS/RTMP/RTSP/TCP/UDP input streams
 - 🔄 **Zero-copy Pipeline**: GPU processing without CPU roundtrips for maximum performance
-- 🎬 **Stream Mapping**: Full FFmpeg `-map` syntax for precise stream control
+- 🎬 **Stream Mapping**: FFmpeg-style `-map` subset for stream control (common cases)
 - 🎵 **Audio Passthrough**: All audio/subtitle streams copied verbatim or transcoded as needed
 - ⚡ **Fast Processing**: ~2-5× real-time speed on RTX 4070 (preset-dependent)
 - 🎨 **HDR Metadata**: Automatic BT.2020/PQ mastering data injection for TrueHDR output
 - 📦 **Flexible Formats**: MP4, MKV, HLS input/output with pipe and fragmented MP4 support
+- **Multi-Audio**: Per-stream audio processing; initial multi-input plumbing present (experimental)
 
 For detailed information about RTX Video SDK capabilities, see [NVIDIA RTX Video SDK Documentation](https://developer.nvidia.com/rtx-video-sdk).
 
@@ -23,9 +24,11 @@ Based on RTX 4070 testing:
 - **p7 preset**: ~2× real-time for 1080p input
 - **p4 preset**: ~3-5× real-time for 1080p input *(note: occasional stutters reported)*
 
-**Project Status**: ⚠️ **Alpha - Not Production Ready**
+**Project Status**: **Beta - Limited Production Use**
 
-This tool is currently in **alpha stage** and provided **as-is without warranty**. While functional as an MVP, further refinement is needed for production use.
+This tool is currently in **beta stage** and provided **as-is without warranty**. While functional as an MVP, further refinement is needed for production use.
+
+I've been test driving the tool for a while now and it has generally been working well so far. Also, as I've been working on this tool, I am considering forking ffmpeg directly and adding the RTX features to it. It's getting a bit too complex for me to handle, and reinventing the wheel is not ideal either. I am open to suggestions and feedback.
 
 **FFmpeg Compatibility**: This is **not a full FFmpeg replacement**. Only a subset of FFmpeg features have been implemented. Tested primarily with Jellyfin and Stremio; other use cases may require additional features.
 
@@ -46,13 +49,15 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **Use case**: Quick video enhancement with RTX processing
 - **Auto-detected**: When no `-i` flag is present (positional input/output arguments)
 - **Features**: RTX VSR + TrueHDR enabled by default, simplified syntax
+ - **Limitation**: Seeking (`-ss`) is not supported in Simple Mode. Use FFmpeg-compatible mode for seeking.
 
 ### 2. FFmpeg-Compatible Mode
 - **Syntax**: `RTXVideoProcessor.exe -i input.mp4 [options] output.mp4`
 - **Use case**: Drop-in FFmpeg replacement with RTX processing
 - **Auto-detected**: When `-i` flag is present in arguments
-- **Features**: FFmpeg syntax support (`-i`, `-map`, `-codec`, `-ss`, etc.) + RTX processing
+- **Features**: FFmpeg-style syntax support for common flags (`-i`, `-map`, `-codec`, `-ss`, etc.) + RTX processing
 - **Behavior**: Strict FFmpeg compliance (no auto-corrections, reports timestamp violations)
+ - **Limitations**: Not a full FFmpeg replacement; some flags/specifiers/edge-cases are not implemented.
 
 ### 3. FFmpeg Passthrough Mode
 - **Trigger**: Binary renamed to `ffmpeg.exe` AND (unsupported format OR `-map -0:v?` video exclusion)
@@ -89,19 +94,24 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`--no-vsr`**: Disable RTX VSR upscaling
 - **`--vsr-quality <1-4>`**: VSR quality level (default 4)
 - **`--no-thdr`**: Disable RTX TrueHDR tone mapping
-- **`--thdr-contrast <int>`**: TrueHDR contrast (default 115)
-- **`--thdr-saturation <int>`**: TrueHDR saturation (default 75)
-- **`--thdr-middle-gray <int>`**: TrueHDR middle gray (default 30)
+- **`--thdr-contrast <int>`**: TrueHDR contrast (default 125)
+- **`--thdr-saturation <int>`**: TrueHDR saturation (default 100)
+- **`--thdr-middle-gray <int>`**: TrueHDR middle gray (default 25)
 - **`--thdr-max-luminance <int>`**: TrueHDR peak luminance in nits (default 1000)
 
 **Encoder Settings**
 - **`--nvenc-tune <string>`**: NVENC tune (default `hq`)
 - **`--nvenc-preset <string>`**: NVENC preset (default `p7`)
-- **`--nvenc-rc <string>`**: NVENC rate control mode (default `constqp`)
-- **`--nvenc-gop <int>`**: GOP length in seconds as `gop * fps` (default 1)
+- **`--nvenc-rc <string>`**: NVENC rate control mode (default `constqp`, options: `cbr`, `vbr`, `vbr_hq`, `constqp`)
+- **`--nvenc-gop <int>`**: GOP length in seconds as `gop * fps` (default 3)
 - **`--nvenc-bframes <int>`**: Maximum B-frame count (default 2)
-- **`--nvenc-qp <int>`**: Constant QP (default 21 when `constqp` is active)
-- **`--nvenc-bitrate-multiplier <int>`**: Bitrate multiplier (default 5×, fallback 25 Mbps)
+- **`--nvenc-qp <int>`**: Constant QP (default 21, only used when `--nvenc-rc constqp`)
+- **`--nvenc-bitrate-multiplier <float>`**: Smart bitrate multiplier (default 2.0, fallback 25 Mbps)
+- **`--nvenc-bitrate <mbps>`**: Target bitrate override (CBR: fixed rate, VBR: average rate)
+- **`--nvenc-maxrate <mbps>`**: VBR max bitrate (default: 3× target, ignored for CBR)
+- **`-r <fps>`, `-r:v <fps>`**: Override output framerate
+   - Works with `-vsync cfr` to produce a constant frame rate timeline
+   - Encoder timebase is chosen to yield exact ticks-per-frame for CFR when possible; otherwise an integer timescale is used
 
 ### FFmpeg-Compatible Mode Only
 
@@ -110,6 +120,7 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
   - Supports local files (`.mp4`, `.mkv`)
   - Supports network streams (`http://`, `https://`, `rtmp://`, `rtsp://`, `tcp://`, `udp://`)
   - Supports pipe input (`pipe:0` or `-`)
+  - Note: Repeating `-i` for multi-input is experimental and not fully wired through the main pipeline; current pipeline opens a single input.
 - **Output**: Specify output file or destination
   - Local files (`.mp4`, `.mkv`, `.m3u8`)
   - Pipe output (`pipe:1`, `pipe:`, or `-`)
@@ -117,14 +128,19 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-y`**: Overwrite output files without asking
 
 **Stream Mapping**
-- **`-map <stream_spec>`**: Select streams to include (e.g., `-map 0:0 -map 0:1`)
+- **`-map <stream_spec>`**: Select streams to include (e.g., `-map 0:0 -map 0:1`, `-map 1:a:0`) [subset]
   - Explicit mapping only includes specified streams
   - Use `-map -0:s` to exclude subtitle streams
+- **`-vn` / `-an` / `-sn` / `-dn`**: Disable video / audio / subtitle / data streams
+- **`-map_metadata <index|-1>`**: Map container metadata from input index, or `-1` to disable
+- **`-map_chapters <index|-1>`**: Map chapters from input index, or `-1` to disable
 - **`-codec:a <codec>`** or **`-c:a <codec>`**: Audio codec (use `copy` for passthrough)
+  - `-codec:a` applies to all audio streams; `-codec:a:0` applies only to the first audio stream
 - **`-ac <channels>`**: Audio channels
 - **`-ab <bitrate>`**: Audio bitrate
 - **`-ar <rate>`**: Audio sample rate
 - **`-af <filter>`**: Audio filter chain
+  - Note: Only a subset of FFmpeg's `-map` selectors and behaviors are supported. Some advanced forms (e.g., complex metadata selectors, program mappings) may not be recognized.
 
 **Input/Demuxer Options**
 - **`-fflags <flags>`**: Format flags for input demuxer (e.g., `+genpts` to generate missing PTS)
@@ -138,13 +154,18 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-start_at_zero`**: Force output timestamps to start at zero
 - **`-avoid_negative_ts <mode>`**: Handle negative timestamps (`auto`/`make_zero`/`make_non_negative`/`disabled`)
 - **`-output_ts_offset <time>`**: Add offset to output timestamps
-- **`-noaccurate_seek`**: Fast seek to nearest keyframe
-- **`-seek2any <0|1>`**: Allow seeking to non-keyframes (may cause artifacts)
-- **`-seek_timestamp <0|1>`**: Use timestamp-based seeking (AVSEEK_FLAG_FRAME)
-  - When enabled (1), seeks by frame timestamps instead of byte positions
-  - Works in combination with `-ss` seeking option
-- **`-vsync <mode>`**: Video synchronization mode
+  - Note: For HLS output, this offset is intentionally not applied to the segment muxer; HLS segments start near zero for better `baseMediaDecodeTime` and player compatibility.
+- **`-noaccurate_seek`**: Discard frames before seek target (default behavior when seeking with `-ss`)
+- **`-seek2any <0|1>`**: Allow seeking to non-keyframes at demuxer level (may cause artifacts until next keyframe)
+  - Enables `AVSEEK_FLAG_ANY` for faster but less accurate seeking
+  - Can produce garbled output until the next keyframe is decoded
+- **`-seek_timestamp <0|1>`**: Enable/disable seeking by timestamp with `-ss`
+  - When disabled (default, `0`): adds stream `start_time` to seek position (FFmpeg default behavior)
+  - When enabled (`1`): seeks to absolute timestamp without adjustment
+  - FFmpeg compatibility option for streams with non-zero start times
+- **`-vsync <mode>`** or **`-fps_mode <mode>`**: Video synchronization mode
   - `cfr`: Constant frame rate - generates evenly spaced timestamps
+  - `passthrough`/`vfr`: Variable frame rate (default behavior)
   - Useful for fixing variable frame rate issues or ensuring consistent playback timing
 
 **HLS Streaming**
@@ -152,18 +173,33 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
 - **`-hls_time <seconds>`**: Segment duration in seconds (default 2)
 - **`-hls_segment_type <type>`**: Segment type (`mpegts` or `fmp4`)
 - **`-hls_fmp4_init_filename <file>`**: fMP4 initialization file name
-- **`-hls_segment_filename <pattern>`**: Segment filename pattern (e.g., `segment_%03d.m4s`)
+- **`-hls_segment_filename <pattern>`**: Segment filename pattern (default: auto-generated with `.m4s` for fMP4, `.ts` for MPEGTS)
 - **`-hls_playlist_type <type>`**: Playlist type (`event` or `vod`)
 - **`-hls_list_size <count>`**: Maximum number of playlist entries (0 = all)
 - **`-start_number <num>`**: Start segment numbering from this value
+  - Subtitle behavior:
+    - For HLS, only WebVTT subtitles are supported. Non-WebVTT subtitle streams are dropped automatically.
+    - For pipe outputs (e.g., `-f mp4 pipe:1`), subtitle streams are omitted.
 
 **Muxer Options**
 - **`-movflags <flags>`**: MP4 muxer flags (e.g., `+faststart`, `+frag_keyframe`)
+  - Default behavior: For ISO BMFF outputs (MP4/fMP4, including HLS with fMP4), the tool enables `+delay_moov` by default alongside other flags (e.g., `+faststart`, `+default_base_moof`, `+write_colr`). Delaying the moov atom improves compatibility with codecs like EAC3 that require packet analysis before header writing.
 - **`-frag_duration <microseconds>`**: Fragment duration for fragmented MP4
 - **`-fragment_index <num>`**: Fragment index
 - **`-use_editlist <0|1>`**: Use MP4 edit lists
 - **`-max_muxing_queue_size <packets>`**: Maximum muxing queue size
 - **`-max_delay <microseconds>`**: Maximum muxing delay
+
+**Advanced GOP/Keyframe Control**
+
+- **`-g <frames>`**: Set GOP size in frames (takes precedence over `--nvenc-gop` seconds)
+- **`-sc_threshold <int>`**: Scene change threshold (primarily for x264/x265; NVENC may ignore)
+- **`-keyint_min <frames>`**: Minimum GOP length in frames
+- **`-no-scenecut`**: Disable adaptive I-frame insertion
+- **`-forced-idr`**: Force IDR frames at GOP boundaries
+
+Notes:
+- For HLS, `strict_gop=1`, `forced-idr=1`, and `no-scenecut=1` are applied to align segments to GOP boundaries. If `-g` is not provided, GOP size defaults to `--nvenc-gop` converted to frames and may align to `-hls_time`.
 
 ## Notes on Default Configuration
 
@@ -173,16 +209,24 @@ RTXVideoProcessor supports **three operating modes** that are automatically dete
   - Can be manually disabled with `--no-vsr`
 
 - **TrueHDR**
-  - Enabled by default with `{contrast=115, saturation=75, middleGray=30, maxLuminance=1000}`
+  - Enabled by default with `{contrast=125, saturation=100, middleGray=25, maxLuminance=1000}`
   - **Auto-disables** for HDR inputs (PQ/HDR10 or HLG) to preserve original HDR metadata
   - Disabling TrueHDR switches the pipeline to BT.709 SDR signaling
   - Can be manually disabled with `--no-thdr`
 
 - **NVENC**
-  - Uses Main10 profile, constant QP 21, preset `p7`, tune `hq`
+  - Uses Main10 profile, preset `p7`, tune `hq`
+  - **Rate control**: Default `constqp` with QP 21 (options: `cbr`, `vbr`, `vbr_hq`, `constqp`)
+  - **Smart bitrate calculation** (CBR/VBR modes):
+    - Codec-aware: H.265 ~30% lower bitrate than H.264 for same quality
+    - Feature-aware: Scales based on upscale + THDR combinations
+    - HDR input: 0.8× adjustment to preserve quality
+    - Example: H.264 input with upscale+THDR → 2.0× base multiplier
+    - Example: H.265 input with upscale only → 1.2× base multiplier
+    - Fallback: 25 Mbps if input bitrate unknown
+  - **VBR max bitrate**: Auto-calculated as 3× target (quality-focused), adjustable via `--nvenc-maxrate`
   - GOP length: `3 × fps` frames
   - B-frames: 2 (default)
-  - Bitrate: `input_bitrate × 5` (fallback: 25 Mbps if unknown)
   - Hardware pool: 64-frame surfaces
 
 - **Color metadata**
@@ -225,8 +269,17 @@ RTXVideoProcessor.exe input.mp4 output.mp4 --no-vsr
 # SDR output (disable both RTX features)
 RTXVideoProcessor.exe input.mp4 output_sdr.mp4 --no-vsr --no-thdr
 
-# Custom NVENC settings
-RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate-multiplier 3 --nvenc-preset p4
+# CBR encoding at fixed 10 Mbps
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc cbr --nvenc-bitrate 10
+
+# VBR encoding: 8 Mbps average, 24 Mbps peak (default 3x)
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate 8
+
+# VBR with custom max rate for streaming (tight ceiling)
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate 8 --nvenc-maxrate 12
+
+# Smart bitrate with higher multiplier
+RTXVideoProcessor.exe input.mp4 output.mp4 --nvenc-rc vbr --nvenc-bitrate-multiplier 2.5
 
 # CPU processing path (no GPU)
 RTXVideoProcessor.exe input.mp4 output.mp4 --cpu --no-vsr
@@ -247,6 +300,10 @@ RTXVideoProcessor.exe -i input.mp4 -codec:a copy output.mp4
 # Audio transcoding with specific codec
 RTXVideoProcessor.exe -i input.mp4 -codec:a aac -ab 192000 -ac 2 output.mp4
 
+# Apply codec to all vs first audio only
+RTXVideoProcessor.exe -i input.mkv -map 0:v -map 0:a -codec:a aac -ab 128k output.mp4   # applies to all audio
+RTXVideoProcessor.exe -i input.mkv -map 0:v -map 0:a -codec:a:0 aac -ab 128k output.mp4 # applies to first audio only
+
 # Seeking: Extract 30 seconds starting from 1 minute
 RTXVideoProcessor.exe -i input.mp4 -ss 00:01:00 -t 30 output.mp4
 
@@ -263,6 +320,13 @@ RTXVideoProcessor.exe -i input.mp4 -format hls -hls_time 6 \
 # HLS with stream mapping and audio copy
 RTXVideoProcessor.exe -i input.mkv -map 0:0 -map 0:1 -codec:a copy \
   -format hls -hls_segment_type fmp4 -hls_fmp4_init_filename init.mp4 output.m3u8
+
+# Multi-input with external audio (experimental)
+# Current pipeline opens a single input; this usage is not fully supported end-to-end yet
+RTXVideoProcessor.exe -i video.mp4 -i audio.ac3 -map 0:v -map 1:a -map_metadata 0 -map_chapters 0 output.mp4
+
+# Advanced GOP control for HLS (force segment-aligned IDR)
+RTXVideoProcessor.exe -i input.mp4 -format hls -hls_time 2 -g 48 -no-scenecut -forced-idr output.m3u8
 
 # Network stream input to local file
 RTXVideoProcessor.exe -i http://example.com/stream.m3u8 output.mp4
@@ -374,7 +438,11 @@ The resulting binary will be at `build-static/Release/RTXVideoProcessor.exe` (~2
 ## Troubleshooting
 - **CUDA negotiation** If CUDA initialization fails, verify the GPU driver, confirm the Video Codec SDK DLLs are present, and try `--cpu` to validate the rest of the pipeline.
 - **HDR validation** When TrueHDR is enabled, ensure your playback tool honors the inserted mastering metadata; fall back to `--no-thdr` for SDR deliveries.
-- **Bitrate control** Tune `--nvenc-rc`, `--nvenc-qp`, or `--nvenc-bitrate-multiplier` to meet delivery requirements.
+- **Bitrate control**
+  - **CQP mode** (default): Use `--nvenc-qp` to control quality (lower = higher quality)
+  - **CBR mode**: Use `--nvenc-bitrate` for fixed bitrate streaming
+  - **VBR mode**: Use `--nvenc-bitrate` for target and `--nvenc-maxrate` to limit peaks
+  - **Smart calculation**: Adjust `--nvenc-bitrate-multiplier` for auto-scaling based on codec and features
 
 ## TODO
 - Resolve stutters at specific presets

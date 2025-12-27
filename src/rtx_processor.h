@@ -18,6 +18,7 @@ struct RTXProcessConfig
 {
     bool enableVSR = true;
     bool enableTHDR = true;
+    bool inputIsHDR = false; // True for PQ/HLG transfer (HDR10, Dolby Vision, HLG)
     int vsrQuality = 4;  // 1..4 (4=highest)
     int scaleFactor = 2; // 2x
     // TrueHDR defaults per sample
@@ -110,6 +111,15 @@ public:
 
     void shutdown();
 
+    // Synchronize the RTX processor's CUDA stream
+    // Call this to ensure all RTX processing operations have completed before
+    // accessing the output frames from other CUDA streams or the encoder
+    void syncStream() const {
+        if (m_stream) {
+            cudaStreamSynchronize(m_stream);
+        }
+    }
+
     // Returns a human-readable description of the last error (if any initialize/process failed)
     const std::string &lastError() const { return m_lastError; }
 
@@ -120,7 +130,7 @@ private:
     bool createRTX(bool thdr, bool vsr);
     void destroyRTX();
 
-    bool allocSurfaces(bool thdr);
+    bool allocSurfaces(bool thdr, bool hdr10BitInput);
     void freeSurfaces();
 
     void setError(const std::string &msg) { m_lastError = msg; }
@@ -148,6 +158,12 @@ private:
     size_t m_devBGRAPitch = 0;
     uint8_t *m_devABGR10 = nullptr; // dstW x dstH x 4, pitched
     size_t m_devABGR10Pitch = 0;
+
+    // Pre-allocated temporary NV12 buffers for P010->NV12 conversion (avoids per-frame allocation)
+    uint8_t *m_devTempY = nullptr;   // srcW x srcH, pitched
+    size_t m_devTempYPitch = 0;
+    uint8_t *m_devTempUV = nullptr;  // srcW x (srcH/2), pitched
+    size_t m_devTempUVPitch = 0;
 
     // Host staging
     std::vector<uint8_t> m_hostOut; // ABGR10 output when THDR enabled, BGRA8 otherwise

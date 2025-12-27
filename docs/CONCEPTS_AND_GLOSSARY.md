@@ -676,8 +676,10 @@ int64_t out_pts = av_rescale_q(in_pts, in_timebase, out_timebase);
 - Buffering and interleaving require predictable order
 
 **RTXVideoProcessor Handling**:
-- Encoder ensures PTS/DTS monotonicity internally
-- Muxer (`av_interleaved_write_frame`) validates and may reject violations
+- Encoder ensures PTS/DTS monotonicity internally, and the pipeline additionally enforces strict DTS monotonicity for audio when muxing MP4/fMP4.
+- Audio PTS is derived from a cumulative `accumulated_audio_samples` counter to maintain sample-accurate timing and avoid drift from resampling.
+- When draining the final audio FIFO frame, any zero-padding does not advance the PTS beyond the actual number of content samples, preventing end-of-stream overshoot.
+- Muxer (`av_interleaved_write_frame`) validates and may reject violations; the pipeline tracks `last_audio_dts` to ensure strictly increasing DTS for audio.
 - Simple Mode: Would auto-fix violations (legacy behavior)
 - FFmpeg-Compatible Mode: Reports violations without auto-fix
 
@@ -837,6 +839,7 @@ I B B P B B P B B I
 - Supports both MPEG-TS and fMP4 segments
 - Configurable segment duration (default: 4 seconds)
 - GOP aligned to segment boundaries
+ - Output timestamp offset (`-output_ts_offset`) is intentionally not applied to HLS segments; segments start near zero to keep `baseMediaDecodeTime` reasonable for players.
 
 ### fMP4 (Fragmented MP4)
 
@@ -926,9 +929,9 @@ Init Segment (header) → Fragment 1 → Fragment 2 → Fragment 3 → ...
 - Generates HDR10 metadata (MaxCLL, MaxFALL)
 
 **Parameters**:
-- **Contrast**: Intensity of highlights (0-200, default 115)
-- **Saturation**: Color intensity (0-200, default 75)
-- **Middle Gray**: Midpoint mapping (0-100, default 30)
+- **Contrast**: Intensity of highlights (0-200, default 125)
+- **Saturation**: Color intensity (0-200, default 100)
+- **Middle Gray**: Midpoint mapping (0-100, default 25)
 - **Max Luminance**: Peak brightness in nits (default 1000)
 
 **RTXVideoProcessor Behavior**:
@@ -1009,13 +1012,19 @@ Muxer → Output File
 - Contains encoded video/audio bitstream
 - Includes PTS, DTS, duration
 
+**AudioEncoderContext**
+- RTXVideoProcessor structure for per-stream audio encoding
+- Contains encoder, resampler, FIFO, filter graph for each audio stream
+- Tracks `accumulated_samples` for sample-accurate PTS
+- Tracks `last_dts` for DTS monotonicity enforcement
+
 **AVSEEK_FLAG_BACKWARD**
 - Seek to nearest keyframe before target
 - Default FFmpeg seeking behavior
 
 **AVSEEK_FLAG_ANY**
 - Allow seeking to non-keyframes (faster but less accurate)
-- Enabled by `-seek2any` or `-noaccurate_seek`
+- Enabled by `-seek2any` flag at demuxer level
 
 **av_rescale_q()**
 - FFmpeg function to convert timestamps between timebases
@@ -1481,6 +1490,17 @@ Muxer → Output File
 - Processing without unnecessary memory copies
 - GPU pipeline: data stays on GPU throughout
 
+**StreamMapSpec**
+- Parsed representation of a `-map` argument
+- Contains input file index, stream index, stream type filter
+- Supports negative maps (exclusions) and optional maps
+- Supports metadata filtering (e.g., `0:m:language:eng`)
+
+**MappedStream**
+- Resolved mapping for a specific output stream
+- Links input file/stream to output stream
+- Indicates whether stream requires processing or copy
+
 ---
 
 ## Additional Resources
@@ -1493,4 +1513,4 @@ Muxer → Output File
 
 ---
 
-**Document Version**: 1.0 (2025-01-21)
+**Document Version**: 1.1 (2025-12-25)

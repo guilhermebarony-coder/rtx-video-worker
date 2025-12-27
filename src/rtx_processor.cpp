@@ -60,7 +60,10 @@ bool RTXProcessor::initialize(int gpuIndex, const RTXProcessConfig &cfg, uint32_
         setError(std::string("RTX API create failed (THDR=") + (cfg.enableTHDR ? "1" : "0") + ", VSR=" + (cfg.enableVSR ? "1" : "0") + ")");
         return false;
     }
-    if (!allocSurfaces(cfg.enableTHDR))
+    // For HDR input without THDR, use 10-bit source array for VSR
+    // For SDR input (even Main10), use 8-bit source array for VSR
+    bool need10BitSource = cfg.inputIsHDR && !cfg.enableTHDR;
+    if (!allocSurfaces(cfg.enableTHDR, need10BitSource))
     {
         if (cfg.enableTHDR)
         {
@@ -68,7 +71,7 @@ bool RTXProcessor::initialize(int gpuIndex, const RTXProcessConfig &cfg, uint32_
         }
         else
         {
-            setError("allocSurfaces failed while creating BGRA surfaces");
+            setError("allocSurfaces failed while creating surfaces");
         }
         return false;
     }
@@ -123,7 +126,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
                              (int)m_srcW, (int)m_srcH,
                              /*bt2020=*/bt2020,
                              m_stream);
-        // Must sync: this is fast path bypass, no more work after this
+
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -140,8 +143,8 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when THDR enabled)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     API_THDR_Setting thdr{};
@@ -203,7 +206,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
                              m_stream);
     }
 
-    // Sync at final output - ensures frame is ready before returning
+
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -222,8 +225,11 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
     // 1) P010 (device) -> X2BGR10LE (10-bit RGB, device pitched) - preserving full 10-bit precision
+    // IMPORTANT: Use m_devBGRA (source-sized buffer) for input conversion, NOT m_devABGR10 (dest-sized).
+    // Using dest-sized buffer for source data causes overlay artifacts when VSR upscales,
+    // because the source data only fills a portion of the buffer and stale data remains.
     launch_p010_to_x2bgr10(d_y, pitchY, d_uv, pitchUV,
-                           m_devABGR10, (int)m_devABGR10Pitch, // Reuse ABGR10 buffer for X2BGR10LE
+                           m_devBGRA, (int)m_devBGRAPitch, // Use source-sized buffer
                            (int)m_srcW, (int)m_srcH,
                            bt2020,
                            m_stream);
@@ -241,13 +247,13 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
             return false;
         }
         // Direct X2BGR10LE -> P010 preserving 10-bit precision with BT.2020 colorspace
-        launch_abgr10_to_p010(m_devABGR10, (int)m_devABGR10Pitch,
+        launch_abgr10_to_p010(m_devBGRA, (int)m_devBGRAPitch,
                               d_outY, pitchOutY,
                               d_outUV, pitchOutUV,
                               (int)m_srcW, (int)m_srcH,
                               /*bt2020=*/true, // Always use BT.2020 for HDR content
                               m_stream);
-        // Must sync: this is fast path bypass, no more work after this
+
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -255,8 +261,8 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     // 2) Copy X2BGR10LE (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
     copyIn.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-    copyIn.srcDevice = (CUdeviceptr)m_devABGR10; // Source is now X2BGR10LE
-    copyIn.srcPitch = (unsigned int)m_devABGR10Pitch;
+    copyIn.srcDevice = (CUdeviceptr)m_devBGRA; // Source-sized X2BGR10LE buffer
+    copyIn.srcPitch = (unsigned int)m_devBGRAPitch;
     copyIn.dstMemoryType = CU_MEMORYTYPE_ARRAY;
     copyIn.dstArray = m_srcArray;
     copyIn.WidthInBytes = (unsigned int)(m_srcW * 4); // 4 bytes per pixel for X2BGR10LE
@@ -264,8 +270,8 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when processing HDR content)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     API_THDR_Setting thdr{};
@@ -313,7 +319,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
                           /*bt2020=*/true, // Always use BT.2020 for HDR content
                           m_stream);
 
-    // Sync at final output - ensures frame is ready before returning
+
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -351,47 +357,32 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                             d_outY, pitchOutY, d_outUV, pitchOutUV,
                             (int)m_srcW, (int)m_srcH,
                             m_stream);
-        // Must sync: this is fast path bypass, no more work after this
+
         cudaStreamSynchronize(m_stream);
         return true;
     }
 
     // VSR and/or THDR enabled: need to go through RTX processing
     // Step 1: P010 (10-bit SDR padded) -> NV12 (8-bit) to extract actual 8-bit data
-    // We need temporary NV12 buffers on device at source resolution
-    uint8_t *d_tempY = nullptr;
-    uint8_t *d_tempUV = nullptr;
-    size_t tempPitchY = 0, tempPitchUV = 0;
-
-    // Allocate temporary NV12 buffers (source resolution)
-    cudaError_t err1 = cudaMallocPitch(&d_tempY, &tempPitchY, m_srcW, m_srcH);
-    cudaError_t err2 = cudaMallocPitch(&d_tempUV, &tempPitchUV, m_srcW, m_srcH / 2);
-    if (err1 != cudaSuccess || err2 != cudaSuccess || !d_tempY || !d_tempUV)
+    // Use pre-allocated temporary NV12 buffers (avoids per-frame allocation overhead)
+    if (!m_devTempY || !m_devTempUV)
     {
-        if (d_tempY)
-            cudaFree(d_tempY);
-        if (d_tempUV)
-            cudaFree(d_tempUV);
-        setError("processGpuP010ToNV12: failed to allocate temp NV12 buffers");
+        setError("processGpuP010ToNV12: temp NV12 buffers not allocated");
         return false;
     }
 
     // Downsample P010 → NV12 (extract 8-bit SDR data)
     launch_p010_to_nv12(d_y, pitchY, d_uv, pitchUV,
-                        d_tempY, (int)tempPitchY, d_tempUV, (int)tempPitchUV,
+                        m_devTempY, (int)m_devTempYPitch, m_devTempUV, (int)m_devTempUVPitch,
                         (int)m_srcW, (int)m_srcH,
                         m_stream);
 
     // Step 2: NV12 (8-bit SDR) -> BGRA8 (device pitched)
-    launch_nv12_to_bgra(d_tempY, (int)tempPitchY, d_tempUV, (int)tempPitchUV,
+    launch_nv12_to_bgra(m_devTempY, (int)m_devTempYPitch, m_devTempUV, (int)m_devTempUVPitch,
                         m_devBGRA, (int)m_devBGRAPitch,
                         (int)m_srcW, (int)m_srcH,
                         false, // bt2020 = false for SDR
                         m_stream);
-
-    // Free temporary buffers
-    cudaFree(d_tempY);
-    cudaFree(d_tempUV);
 
     // Step 3: Copy BGRA8 (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
@@ -405,8 +396,8 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // Step 4: RTX evaluate: m_srcTex -> m_dstSurf (BGRA8 for SDR output)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     // THDR should be disabled for SDR content
@@ -438,7 +429,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
                          false, // bt2020 = false for SDR
                          m_stream);
 
-    // Sync at final output - ensures frame is ready before returning
+
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -456,40 +447,28 @@ bool RTXProcessor::processGpuP010SDRToP010(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
     // Step 1: P010 → NV12 (extract 8-bit SDR)
-    // Allocate temporary NV12 buffers at source resolution
-    uint8_t *d_tempY = nullptr;
-    uint8_t *d_tempUV = nullptr;
-    size_t tempPitchY = 0, tempPitchUV = 0;
-
-    cudaError_t err1 = cudaMallocPitch(&d_tempY, &tempPitchY, m_srcW, m_srcH);
-    cudaError_t err2 = cudaMallocPitch(&d_tempUV, &tempPitchUV, m_srcW, m_srcH / 2);
-    if (err1 != cudaSuccess || err2 != cudaSuccess || !d_tempY || !d_tempUV)
+    // Use pre-allocated temporary NV12 buffers (avoids per-frame allocation overhead)
+    if (!m_devTempY || !m_devTempUV)
     {
-        if (d_tempY)
-            cudaFree(d_tempY);
-        if (d_tempUV)
-            cudaFree(d_tempUV);
-        setError("processGpuP010SDRToP010: failed to allocate temp NV12 buffers");
+        setError("processGpuP010SDRToP010: temp NV12 buffers not allocated");
         return false;
     }
 
     launch_p010_to_nv12(d_y, pitchY, d_uv, pitchUV,
-                        d_tempY, (int)tempPitchY, d_tempUV, (int)tempPitchUV,
+                        m_devTempY, (int)m_devTempYPitch, m_devTempUV, (int)m_devTempUVPitch,
                         (int)m_srcW, (int)m_srcH,
                         m_stream);
 
+    // Synchronize after p010_to_nv12 kernel before passing temp buffers to next function
+    // This ensures the temp buffers contain valid data before processGpuNV12ToP010 reads them
+    cudaStreamSynchronize(m_stream);
+
     // Step 2: NV12 → BGRA8 → RTX (VSR+THDR) → ABGR10 → P010
-    // Reuse the NV12ToP010 logic by calling it with the temp NV12 buffers
-    bool result = processGpuNV12ToP010(d_tempY, (int)tempPitchY,
-                                       d_tempUV, (int)tempPitchUV,
-                                       encP010Frame,
-                                       false); // bt2020=false for SDR input
-
-    // Free temporary buffers
-    cudaFree(d_tempY);
-    cudaFree(d_tempUV);
-
-    return result;
+    // Reuse the NV12ToP010 logic by calling it with the pre-allocated temp NV12 buffers
+    return processGpuNV12ToP010(m_devTempY, (int)m_devTempYPitch,
+                                m_devTempUV, (int)m_devTempUVPitch,
+                                encP010Frame,
+                                false); // bt2020=false for SDR input
 }
 
 bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
@@ -531,7 +510,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                              (int)m_srcW, (int)m_srcH,
                              /*bt2020=*/bt2020,
                              m_stream);
-        // Must sync: this is fast path bypass, no more work after this
+
         cudaStreamSynchronize(m_stream);
         return true;
     }
@@ -548,8 +527,8 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
     // RTX evaluate (BGRA8 in, BGRA8 or ABGR10 out depending on THDR)
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality;
     API_THDR_Setting thdr{};
@@ -595,7 +574,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                          /*bt2020=*/bt2020,
                          m_stream);
 
-    // Sync at final output - ensures frame is ready before returning
+
     cudaStreamSynchronize(m_stream);
     return true;
 }
@@ -618,7 +597,10 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
         setError(std::string("RTX API create failed (THDR=") + (cfg.enableTHDR ? "1" : "0") + ", VSR=" + (cfg.enableVSR ? "1" : "0") + ")");
         return false;
     }
-    if (!allocSurfaces(cfg.enableTHDR))
+    // For HDR input without THDR, use 10-bit source array for VSR
+    // For SDR input (even Main10), use 8-bit source array for VSR
+    bool need10BitSource = cfg.inputIsHDR && !cfg.enableTHDR;
+    if (!allocSurfaces(cfg.enableTHDR, need10BitSource))
     {
         setError("allocSurfaces failed in initializeWithContext");
         return false;
@@ -643,6 +625,20 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
     }
     m_devABGR10Pitch = pitch;
 
+    // Pre-allocate temporary NV12 buffers for P010->NV12 conversion (avoids per-frame allocation)
+    if (cudaMallocPitch(&m_devTempY, &pitch, m_srcW, m_srcH) != cudaSuccess)
+    {
+        setError("cudaMallocPitch m_devTempY failed");
+        return false;
+    }
+    m_devTempYPitch = pitch;
+    if (cudaMallocPitch(&m_devTempUV, &pitch, m_srcW, m_srcH / 2) != cudaSuccess)
+    {
+        setError("cudaMallocPitch m_devTempUV failed");
+        return false;
+    }
+    m_devTempUVPitch = pitch;
+
     m_initialized = true;
     return true;
 }
@@ -665,8 +661,8 @@ bool RTXProcessor::process(const uint8_t *inBGRA, size_t inPitchBytes,
     copyIn.Height = m_srcH;
     CUDADRV_CHECK(cuMemcpy2D(&copyIn));
 
-    API_RECT srcRect{0, 0, (int)m_srcW, (int)m_srcH};
-    API_RECT dstRect{0, 0, (int)m_dstW, (int)m_dstH};
+    API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
+    API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
 
     API_VSR_Setting vsr{};
     vsr.QualityLevel = m_cfg.vsrQuality; // 1..4
@@ -758,13 +754,15 @@ void RTXProcessor::destroyRTX()
     rtx_video_api_cuda_shutdown();
 }
 
-bool RTXProcessor::allocSurfaces(bool thdr)
+bool RTXProcessor::allocSurfaces(bool thdr, bool hdr10BitInput)
 {
-    // Create source array BGRA8
+    // Create source array: 10-bit for HDR input, 8-bit for SDR input
+    // HDR content (PQ/HLG) requires 10-bit precision through VSR pipeline
+    // SDR content (even in Main10/P010) uses 8-bit for VSR
     CUDA_ARRAY_DESCRIPTOR srcDesc{};
     srcDesc.Width = m_srcW;
     srcDesc.Height = m_srcH;
-    srcDesc.Format = CU_AD_FORMAT_UNSIGNED_INT8;
+    srcDesc.Format = hdr10BitInput ? CU_AD_FORMAT_UNORM_INT_101010_2 : CU_AD_FORMAT_UNSIGNED_INT8;
     srcDesc.NumChannels = 4;
 
     CUDADRV_CHECK(cuArrayCreate(&m_srcArray, &srcDesc));
@@ -781,11 +779,16 @@ bool RTXProcessor::allocSurfaces(bool thdr)
 
     CUDADRV_CHECK(cuTexObjectCreate(&m_srcTex, &srcRes, &texDesc, nullptr));
 
-    // Destination: if THDR, we need 10-bit A2R10G10B10 (UNORM 10:10:10:2)
+    // Destination: use 10-bit A2R10G10B10 (UNORM 10:10:10:2) whenever we are in a 10-bit
+    // HDR pipeline (hdr10BitInput), or when TrueHDR is enabled. This ensures that when
+    // the input to VSR is 10-bit (AGBR10/X2BGR10), the output surface remains 10-bit
+    // ABGR10 even if THDR is disabled, matching the expectations of the abgr10_to_p010
+    // conversion path.
     CUDA_ARRAY_DESCRIPTOR dstDesc{};
     dstDesc.Width = m_dstW;
     dstDesc.Height = m_dstH;
-    dstDesc.Format = thdr ? CU_AD_FORMAT_UNORM_INT_101010_2 : CU_AD_FORMAT_UNSIGNED_INT8;
+    dstDesc.Format = (thdr || hdr10BitInput) ? CU_AD_FORMAT_UNORM_INT_101010_2
+                                             : CU_AD_FORMAT_UNSIGNED_INT8;
     dstDesc.NumChannels = 4;
 
     CUresult cres = cuArrayCreate(&m_dstArray, &dstDesc);
@@ -848,6 +851,18 @@ void RTXProcessor::freeSurfaces()
         cudaFree(m_devABGR10);
         m_devABGR10 = nullptr;
         m_devABGR10Pitch = 0;
+    }
+    if (m_devTempY)
+    {
+        cudaFree(m_devTempY);
+        m_devTempY = nullptr;
+        m_devTempYPitch = 0;
+    }
+    if (m_devTempUV)
+    {
+        cudaFree(m_devTempUV);
+        m_devTempUV = nullptr;
+        m_devTempUVPitch = 0;
     }
 
     if (m_ctx)

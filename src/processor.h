@@ -27,8 +27,8 @@ public:
 class GpuProcessor : public IProcessor
 {
 public:
-    GpuProcessor(RTXProcessor &rtx, CudaFramePool &pool, AVColorSpace colorSpace, bool thdrEnabled)
-        : m_rtx(rtx), m_pool(pool), m_bt2020(colorSpace == AVCOL_SPC_BT2020_NCL), m_thdrEnabled(thdrEnabled) {}
+    GpuProcessor(RTXProcessor &rtx, CudaFramePool &pool, AVColorSpace colorSpace, bool thdrEnabled, bool inputIsHDR = false)
+        : m_rtx(rtx), m_pool(pool), m_bt2020(colorSpace == AVCOL_SPC_BT2020_NCL), m_thdrEnabled(thdrEnabled), m_inputIsHDR(inputIsHDR) {}
 
     bool process(const AVFrame *decframe, AVFrame *&outFrame) override
     {
@@ -48,30 +48,37 @@ public:
 
         if (sw_format == AV_PIX_FMT_P010LE)
         {
-            // P010 input: could be true HDR (BT.2020) or SDR (BT.709) in 10-bit container (Main10)
-            // Key distinction: m_bt2020 tells us if input is true HDR or just SDR in P010 format
+            // P010 input: Determine processing path based on:
+            // 1. Transfer characteristic (PQ/HLG) = true HDR
+            // 2. THDR enabled = need 10-bit output surface
+            // 3. Colorspace (BT.2020) = affects color conversion coefficients
 
-            if (m_bt2020)
+            if (m_inputIsHDR)
             {
-                // True HDR input (BT.2020): preserve 10-bit pipeline
-                // P010 -> X2BGR10LE (10-bit) -> RTX -> ABGR10 -> P010
+                // True HDR input (PQ/HLG transfer): Must preserve 10-bit pipeline
+                // THDR must be disabled for HDR input (handled by configure_input_hdr_detection)
+                // P010 -> X2BGR10LE (10-bit) -> RTX (VSR with 10-bit source array) -> ABGR10 -> P010
+                // The 10-bit source array is allocated when inputIsHDR=true && enableTHDR=false
                 ok = m_rtx.processGpuP010ToP010(decframe->data[0], decframe->linesize[0],
                                                 decframe->data[1], decframe->linesize[1],
                                                 enc_hw, m_bt2020);
             }
             else
             {
-                // SDR input in P010 format (BT.709): treat as 8-bit SDR
+                // SDR in 10-bit container (Main10 profile): BT.709/BT.2020 transfer, not PQ/HLG
+                // Examples: HEVC Main10 with SDR content, VP9 Profile 2 with SDR
                 if (m_thdrEnabled)
                 {
-                    // THDR enabled for SDR: P010 -> NV12 (8-bit) -> BGRA8 -> RTX (VSR+THDR) -> ABGR10 -> P010
+                    // THDR enabled: Convert SDR to HDR
+                    // P010 -> NV12 (8-bit) -> BGRA8 -> RTX (VSR+THDR) -> ABGR10 -> P010
                     ok = m_rtx.processGpuP010SDRToP010(decframe->data[0], decframe->linesize[0],
                                                        decframe->data[1], decframe->linesize[1],
                                                        enc_hw);
                 }
                 else
                 {
-                    // No THDR: P010 -> NV12 (8-bit) -> BGRA8 -> RTX (VSR only) -> BGRA8 -> NV12
+                    // No THDR: Keep as SDR, output NV12 (8-bit)
+                    // P010 -> NV12 (8-bit) -> BGRA8 -> RTX (VSR only) -> BGRA8 -> NV12
                     ok = m_rtx.processGpuP010ToNV12(decframe->data[0], decframe->linesize[0],
                                                     decframe->data[1], decframe->linesize[1],
                                                     enc_hw);
@@ -107,6 +114,7 @@ private:
     CudaFramePool &m_pool;
     bool m_bt2020 = false;
     bool m_thdrEnabled = false;
+    bool m_inputIsHDR = false;
 };
 
 class CpuProcessor : public IProcessor
@@ -148,7 +156,8 @@ public:
             const int *coeffs = (decframe->colorspace == AVCOL_SPC_BT2020_NCL)
                                     ? sws_getCoefficients(SWS_CS_BT2020)
                                     : sws_getCoefficients(SWS_CS_ITU709);
-            sws_setColorspaceDetails(m_sws_to_argb, coeffs, 0, coeffs, 1, 0, 1 << 16, 1 << 16);
+            int srcRange = (decframe->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+            sws_setColorspaceDetails(m_sws_to_argb, coeffs, srcRange, coeffs, 1, 0, 1 << 16, 1 << 16);
             m_last_src_format = decframe->format;
             m_last_src_w = decframe->width;
             m_last_src_h = decframe->height;
@@ -182,9 +191,10 @@ public:
                 return false;
             const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
                                                      : sws_getCoefficients(SWS_CS_ITU709);
+            // Source is RGB(A) from RTX (full-range); destination YUV should be limited-range
             sws_setColorspaceDetails(m_sws_to_yuv,
-                                     coeffs, m_rtx_cfg.enableTHDR ? 1 : 0,
-                                     coeffs, m_rtx_cfg.enableTHDR ? 0 : 0,
+                                     coeffs, 1,
+                                     coeffs, 0,
                                      0, 1 << 16, 1 << 16);
         }
 
@@ -230,9 +240,10 @@ public:
             throw std::runtime_error("CpuProcessor: sws_to_yuv alloc failed in setConfig");
         const int *coeffs = m_rtx_cfg.enableTHDR ? sws_getCoefficients(SWS_CS_BT2020)
                                                  : sws_getCoefficients(SWS_CS_ITU709);
+        // Source is RGB(A) from RTX (full-range); destination YUV should be limited-range
         sws_setColorspaceDetails(m_sws_to_yuv,
-                                 coeffs, m_rtx_cfg.enableTHDR ? 1 : 0,
-                                 coeffs, m_rtx_cfg.enableTHDR ? 0 : 0,
+                                 coeffs, 1,
+                                 coeffs, 0,
                                  0, 1 << 16, 1 << 16);
     }
 
@@ -263,6 +274,4 @@ private:
 
     FramePtr m_bgra{nullptr, &av_frame_free_single_fp};
     FramePtr m_out{nullptr, &av_frame_free_single_fp};
-
-    bool m_rtx_initialized = false;
 };

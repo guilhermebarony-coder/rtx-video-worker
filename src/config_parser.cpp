@@ -61,6 +61,23 @@ static int get_env_int(const char *name, int default_value)
     }
 }
 
+// Helper function: get environment variable as int64_t with default
+static int64_t get_env_int64(const char *name, int64_t default_value)
+{
+    const char *value = std::getenv(name);
+    if (!value)
+        return default_value;
+    try
+    {
+        return std::stoll(value);
+    }
+    catch (...)
+    {
+        fprintf(stderr, "Warning: Invalid int64 value for %s: %s (using default: %lld)\n", name, value, (long long)default_value);
+        return default_value;
+    }
+}
+
 // Helper function: get environment variable as boolean (1/true/yes = true, 0/false/no = false)
 static bool get_env_bool(const char *name, bool default_value)
 {
@@ -75,17 +92,6 @@ static bool get_env_bool(const char *name, bool default_value)
     fprintf(stderr, "Warning: Invalid boolean value for %s: %s (using default: %s)\n",
             name, value, default_value ? "true" : "false");
     return default_value;
-}
-
-// Helper function: check if output is a pipe/stdout
-static bool is_pipe_output(const char *path)
-{
-    if (!path)
-        return false;
-    return (std::strcmp(path, "-") == 0) ||
-           (std::strcmp(path, "pipe:") == 0) ||
-           (std::strcmp(path, "pipe:1") == 0) ||
-           (std::strncmp(path, "pipe:", 5) == 0);
 }
 
 void print_help(const char *argv0)
@@ -108,18 +114,26 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4 (env: RTX_VSR_QUALITY)\n");
     fprintf(stderr, "\nTHDR options:\n");
     fprintf(stderr, "  --no-thdr     Disable THDR (env: RTX_NO_THDR=1)\n");
-    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 115 (env: RTX_THDR_CONTRAST)\n");
-    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 75 (env: RTX_THDR_SATURATION)\n");
-    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 30 (env: RTX_THDR_MIDDLE_GRAY)\n");
+    fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 125 (env: RTX_THDR_CONTRAST)\n");
+    fprintf(stderr, "  --thdr-saturation Set THDR saturation, default 100 (env: RTX_THDR_SATURATION)\n");
+    fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 25 (env: RTX_THDR_MIDDLE_GRAY)\n");
     fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000 (env: RTX_THDR_MAX_LUMINANCE)\n");
     fprintf(stderr, "\nNVENC options:\n");
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq (env: RTX_NVENC_TUNE)\n");
     fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7 (env: RTX_NVENC_PRESET)\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp (env: RTX_NVENC_RC)\n");
+    fprintf(stderr, "  -g <frames>         Set GOP size in frames (FFmpeg compatible)\n");
     fprintf(stderr, "  --nvenc-gop         Set NVENC GOP (seconds), default 3 (env: RTX_NVENC_GOP)\n");
     fprintf(stderr, "  --nvenc-bframes     Set NVENC bframes, default 2 (env: RTX_NVENC_BFRAMES)\n");
     fprintf(stderr, "  --nvenc-qp          Set NVENC QP, default 21 (env: RTX_NVENC_QP)\n");
     fprintf(stderr, "  --nvenc-bitrate-multiplier Set NVENC bitrate multiplier, default 2 (env: RTX_NVENC_BITRATE_MULTIPLIER)\n");
+    fprintf(stderr, "  --nvenc-bitrate <mbps>  Set target bitrate (CBR: fixed, VBR: average) (env: RTX_NVENC_BITRATE)\n");
+    fprintf(stderr, "  --nvenc-maxrate <mbps>  Set VBR max bitrate, default 3x target (env: RTX_NVENC_MAXRATE)\n");
+    fprintf(stderr, "\nAdvanced keyframe control:\n");
+    fprintf(stderr, "  -sc_threshold <int> Scene change threshold 0-100 (x264/x265 only, not NVENC)\n");
+    fprintf(stderr, "  -keyint_min <int>   Minimum GOP length in frames\n");
+    fprintf(stderr, "  -no-scenecut        Disable scene detection (NVENC: prevents adaptive I-frames)\n");
+    fprintf(stderr, "  -forced-idr         Force IDR frames at GOP boundaries (NVENC)\n");
     fprintf(stderr, "\nEnvironment variables can be used to set defaults. Command-line flags override environment variables.\n");
     fprintf(stderr, "\nInput/Demuxer options:\n");
     fprintf(stderr, "  -fflags <flags>                 Format flags (e.g., +genpts to generate PTS, +igndts to ignore DTS)\n");
@@ -142,7 +156,7 @@ void print_help(const char *argv0)
 static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
 {
     // Enable verbose logging
-    cfg->verbose = true;
+    cfg->debug = true;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -184,7 +198,9 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 fprintf(stderr, "-i requires an input path\n");
                 exit(1);
             }
-            cfg->inputPath = extract_ffmpeg_file_path(argv[++i]);
+            char *path = extract_ffmpeg_file_path(argv[++i]);
+            // Support multiple -i flags for multi-input
+            cfg->inputPaths.push_back(path);
         }
         else if (arg == "-max_delay")
         {
@@ -321,6 +337,60 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->streamMaps.push_back(argv[++i]);
         }
+        else if (arg == "-vn")
+        {
+            cfg->disableVideo = true;
+        }
+        else if (arg == "-an")
+        {
+            cfg->disableAudio = true;
+        }
+        else if (arg == "-sn")
+        {
+            cfg->disableSubtitle = true;
+        }
+        else if (arg == "-dn")
+        {
+            cfg->disableData = true;
+        }
+        else if (arg == "-map_metadata")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-map_metadata requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->mapMetadata = std::stoi(value);
+                cfg->hasMapMetadata = true;
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -map_metadata: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-map_chapters")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-map_chapters requires a value\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->mapChapters = std::stoi(value);
+                cfg->hasMapChapters = true;
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -map_chapters: %s\n", value);
+                exit(1);
+            }
+        }
         else if (arg.substr(0, 7) == "-codec:" || arg.substr(0, 3) == "-c:")
         {
             if (i + 1 >= argc)
@@ -331,6 +401,8 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             if (arg == "-codec:a:0" || arg == "-c:a:0" || arg == "-codec:a" || arg == "-c:a")
             {
                 cfg->audioCodec = argv[++i];
+                // Distinguish between -codec:a (all audio) and -codec:a:0 (first audio)
+                cfg->audioCodecApplyToAll = (arg == "-codec:a" || arg == "-c:a");
             }
         }
         else if (arg == "-ac")
@@ -396,6 +468,68 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->audioFilter = argv[++i];
         }
+        else if (arg == "-g")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-g requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->gopFrames = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -g: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-sc_threshold")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-sc_threshold requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->scThreshold = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -sc_threshold: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-keyint_min")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "-keyint_min requires an argument\n");
+                exit(1);
+            }
+            const char *value = argv[++i];
+            try
+            {
+                cfg->keyintMin = std::stoi(value);
+            }
+            catch (...)
+            {
+                fprintf(stderr, "Invalid value for -keyint_min: %s\n", value);
+                exit(1);
+            }
+        }
+        else if (arg == "-no-scenecut")
+        {
+            cfg->noScenecut = true;
+        }
+        else if (arg == "-forced-idr")
+        {
+            cfg->forcedIdr = true;
+        }
         else if (arg == "-ss")
         {
             if (i + 1 >= argc)
@@ -406,7 +540,7 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             // Determine if this is input seeking or output seeking based on context
             // If we haven't seen -i yet, it's input seeking
             // If we have seen -i, it's output seeking
-            if (cfg->inputPath == nullptr)
+            if (cfg->inputPaths.empty())
             {
                 cfg->seekTime = argv[++i];
             }
@@ -441,22 +575,45 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->avoidNegativeTs = argv[++i];
         }
-        else if (arg == "-vsync")
+        else if (arg == "-output_ts_offset")
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "-vsync requires a value\n");
-                fprintf(stderr, "Supported modes: cfr (constant frame rate)\n");
+                fprintf(stderr, "-output_ts_offset requires a time value\n");
+                exit(1);
+            }
+            cfg->outputTsOffset = argv[++i];
+        }
+        else if (arg == "-vsync" || arg == "-fps_mode")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "%s requires a value\n", arg.c_str());
+                fprintf(stderr, "Supported modes: cfr (constant frame rate), passthrough/vfr (variable frame rate)\n");
                 exit(1);
             }
             cfg->vsync = argv[++i];
             // Validate supported modes
-            if (cfg->vsync != "cfr" && cfg->vsync != "0")
+            // FFmpeg equivalents: cfr=0, vfr=1, passthrough=2, auto=-1
+            if (cfg->vsync == "passthrough" || cfg->vsync == "vfr" || cfg->vsync == "1" || cfg->vsync == "2")
             {
-                fprintf(stderr, "Unsupported -vsync mode: %s\n", cfg->vsync.c_str());
-                fprintf(stderr, "Only 'cfr' is currently supported\n");
+                cfg->vsync = ""; // Empty = VFR passthrough (default behavior)
+            }
+            else if (cfg->vsync != "cfr" && cfg->vsync != "0")
+            {
+                fprintf(stderr, "Unsupported %s mode: %s\n", arg.c_str(), cfg->vsync.c_str());
+                fprintf(stderr, "Supported: cfr (or 0), passthrough/vfr (or 1/2)\n");
                 exit(1);
             }
+        }
+        else if (arg == "-r" || arg == "-r:v")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "%s requires a framerate value\n", arg.c_str());
+                exit(1);
+            }
+            cfg->outputFrameRate = argv[++i];
         }
         else if (arg == "-output_ts_offset")
         {
@@ -475,19 +632,21 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "-seek2any requires a value\n");
+                fprintf(stderr, "-seek2any requires 0 or 1\n");
                 exit(1);
             }
-            cfg->seek2any = (std::stoi(argv[++i]) != 0);
+            int value = std::atoi(argv[++i]);
+            cfg->seek2any = (value != 0);
         }
         else if (arg == "-seek_timestamp")
         {
             if (i + 1 >= argc)
             {
-                fprintf(stderr, "-seek_timestamp requires a value\n");
+                fprintf(stderr, "-seek_timestamp requires 0 or 1\n");
                 exit(1);
             }
-            cfg->seekTimestamp = (std::stoi(argv[++i]) != 0);
+            int value = std::atoi(argv[++i]);
+            cfg->seekTimestamp = (value != 0);
         }
         else if (arg == "-movflags")
         {
@@ -605,7 +764,7 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
 static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
 {
     int i = 1;
-    cfg->inputPath = argv[i++];
+    cfg->inputPaths.push_back(argv[i++]);
     cfg->outputPath = argv[i++];
 
     for (; i < argc; ++i)
@@ -908,6 +1067,53 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
         }
+        else if (arg == "-g")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->gopFrames = std::stoi(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -g\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-sc_threshold")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->scThreshold = std::stoi(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -sc_threshold\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-keyint_min")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->keyintMin = std::stoi(argv[++i]);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for -keyint_min\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "-no-scenecut")
+        {
+            cfg->noScenecut = true;
+        }
+        else if (arg == "-forced-idr")
+        {
+            cfg->forcedIdr = true;
+        }
         else if (arg == "--nvenc-gop")
         {
             if (i + 1 < argc)
@@ -930,6 +1136,34 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
             else
             {
                 fprintf(stderr, "Missing argument for --nvenc-bframes\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "--nvenc-bitrate")
+        {
+            if (i + 1 < argc)
+            {
+                double mbps = std::stod(argv[++i]);
+                cfg->targetBitrate = (int64_t)(mbps * 1000000);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for --nvenc-bitrate\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "--nvenc-maxrate")
+        {
+            if (i + 1 < argc)
+            {
+                double mbps = std::stod(argv[++i]);
+                cfg->maxBitrate = (int64_t)(mbps * 1000000);
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for --nvenc-maxrate\n");
                 print_help(argv[0]);
                 exit(1);
             }
@@ -959,9 +1193,9 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->rtxCfg.vsrQuality = get_env_int("RTX_VSR_QUALITY", 4);
 
     cfg->rtxCfg.enableTHDR = !get_env_bool("RTX_NO_THDR", false);
-    cfg->rtxCfg.thdrContrast = get_env_int("RTX_THDR_CONTRAST", 115);
-    cfg->rtxCfg.thdrSaturation = get_env_int("RTX_THDR_SATURATION", 75);
-    cfg->rtxCfg.thdrMiddleGray = get_env_int("RTX_THDR_MIDDLE_GRAY", 30);
+    cfg->rtxCfg.thdrContrast = get_env_int("RTX_THDR_CONTRAST", 125);
+    cfg->rtxCfg.thdrSaturation = get_env_int("RTX_THDR_SATURATION", 100);
+    cfg->rtxCfg.thdrMiddleGray = get_env_int("RTX_THDR_MIDDLE_GRAY", 25);
     cfg->rtxCfg.thdrMaxLuminance = get_env_int("RTX_THDR_MAX_LUMINANCE", 1000);
 
     const char *env_tune = get_env_var("RTX_NVENC_TUNE");
@@ -974,6 +1208,8 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->bframes = get_env_int("RTX_NVENC_BFRAMES", 2);
     cfg->qp = get_env_int("RTX_NVENC_QP", 21);
     cfg->targetBitrateMultiplier = get_env_int("RTX_NVENC_BITRATE_MULTIPLIER", 2);
+    cfg->targetBitrate = get_env_int64("RTX_NVENC_BITRATE", -1);
+    cfg->maxBitrate = get_env_int64("RTX_NVENC_MAXRATE", -1);
 
     // Determine parsing mode: simple (input output [opts]) vs FFmpeg-compatible (-i input -f format output)
     // Simple mode: first arg is input file (positional)
