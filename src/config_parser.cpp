@@ -2,6 +2,7 @@
 #include "logger.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -112,6 +113,8 @@ void print_help(const char *argv0)
     fprintf(stderr, "\nVSR options:\n");
     fprintf(stderr, "  --no-vsr      Disable VSR (env: RTX_NO_VSR=1)\n");
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4 (env: RTX_VSR_QUALITY)\n");
+    fprintf(stderr, "  --vsr-scale       Output scale factor 1-4, default 2 (env: RTX_VSR_SCALE)\n");
+    fprintf(stderr, "  --no-vsr-yuv-restore  Disable OOG-safe residual reconstruction on the SDR VSR path (env: RTX_NO_VSR_YUV_RESTORE=1)\n");
     fprintf(stderr, "\nTHDR options:\n");
     fprintf(stderr, "  --no-thdr     Disable THDR (env: RTX_NO_THDR=1)\n");
     fprintf(stderr, "  --thdr-contrast   Set THDR contrast, default 125 (env: RTX_THDR_CONTRAST)\n");
@@ -698,6 +701,10 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
         {
             cfg->rtxCfg.enableVSR = false;
         }
+        else if (arg == "--no-vsr-yuv-restore")
+        {
+            cfg->rtxCfg.vsrYuvRestore = false;
+        }
         else if (arg == "--vsr-quality")
         {
             if (i + 1 >= argc)
@@ -706,6 +713,21 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
             cfg->rtxCfg.vsrQuality = std::stoi(argv[++i]);
+        }
+        else if (arg == "--vsr-scale")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--vsr-scale requires an argument\n");
+                exit(1);
+            }
+            // Output = input * scaleFactor. VSR supports arbitrary output rects;
+            // clamp 1..4 (4x = e.g. 480p->1080p, 540p->4K). Everything downstream
+            // (main.cpp, rtx_processor) already derives dst dims from this.
+            int sf = std::stoi(argv[++i]);
+            if (sf < 1) sf = 1;
+            if (sf > 4) sf = 4;
+            cfg->rtxCfg.scaleFactor = sf;
         }
         // RTX THDR flags
         else if (arg == "--no-thdr")
@@ -953,6 +975,8 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
         // VSR
         else if (arg == "--no-vsr")
             cfg->rtxCfg.enableVSR = false;
+        else if (arg == "--no-vsr-yuv-restore")
+            cfg->rtxCfg.vsrYuvRestore = false;
         else if (arg == "--vsr-quality")
         {
             if (i + 1 < argc)
@@ -962,6 +986,23 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
             else
             {
                 fprintf(stderr, "Missing argument for --vsr-quality\n");
+                print_help(argv[0]);
+                exit(1);
+            }
+        }
+        else if (arg == "--vsr-scale")
+        {
+            if (i + 1 < argc)
+            {
+                // Output = input * scaleFactor. Clamp 1..4 (4x = e.g. 480p->1080p).
+                int sf = std::stoi(argv[++i]);
+                if (sf < 1) sf = 1;
+                if (sf > 4) sf = 4;
+                cfg->rtxCfg.scaleFactor = sf;
+            }
+            else
+            {
+                fprintf(stderr, "Missing argument for --vsr-scale\n");
                 print_help(argv[0]);
                 exit(1);
             }
@@ -1189,7 +1230,8 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     // Set default values (with environment variable overrides)
     // Command-line flags will override these
     cfg->rtxCfg.enableVSR = !get_env_bool("RTX_NO_VSR", false);
-    cfg->rtxCfg.scaleFactor = 2;
+    cfg->rtxCfg.vsrYuvRestore = !get_env_bool("RTX_NO_VSR_YUV_RESTORE", false);
+    cfg->rtxCfg.scaleFactor = get_env_int("RTX_VSR_SCALE", 2);
     cfg->rtxCfg.vsrQuality = get_env_int("RTX_VSR_QUALITY", 4);
 
     cfg->rtxCfg.enableTHDR = !get_env_bool("RTX_NO_THDR", false);
@@ -1235,4 +1277,11 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
         // Simple mode (positional input/output)
         parse_simple_mode(argc, argv, cfg);
     }
+
+    // Single validation contract, applied AFTER every override source
+    // (env defaults, then CLI): the effective VSR scale is always 1..4,
+    // no matter which path set it. Output dims and allocations derive
+    // from this value, so an unclamped 0/negative/huge scale would mean
+    // invalid dimensions or absurd VRAM pressure.
+    cfg->rtxCfg.scaleFactor = std::min(4, std::max(1, cfg->rtxCfg.scaleFactor));
 }

@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
+# Remember whether the USER provided CMAKE_CUDA_ARCHITECTURES: it must be
+# checked before project() — CUDA compiler detection auto-fills it after.
+if(DEFINED CMAKE_CUDA_ARCHITECTURES OR DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
+  set(RTX_USER_CUDA_ARCHS TRUE)
+else()
+  set(RTX_USER_CUDA_ARCHS FALSE)
+endif()
 project(RTXVideoProcessor LANGUAGES C CXX CUDA)
 
 # Modern CMake policies
@@ -8,9 +15,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Target recent NVIDIA architectures (adjust if needed). 89 = Ada (RTX 40 series)
-set(CMAKE_CUDA_ARCHITECTURES 89)
 
 # Use static MSVC runtime (/MT for Release, /MTd for Debug)
 # Requires CMake >= 3.15; this project requires 3.24 at top, so it's safe.
@@ -34,6 +38,18 @@ option(USE_STATIC_FFMPEG "Link FFmpeg statically (requires vcpkg or static FFmpe
 
 # CUDA (Toolkit 12.x)
 find_package(CUDAToolkit REQUIRED)
+
+# Target NVIDIA RTX architectures: 75=Turing(20), 86=Ampere(30), 89=Ada(40),
+# 120=Blackwell(50, e.g. RTX 5080). Only set when the user did not provide
+# CMAKE_CUDA_ARCHITECTURES, and add Blackwell conditionally — arch 120 is
+# unknown to nvcc before Toolkit 12.8 and would break RTX 20-40 builds.
+if(NOT RTX_USER_CUDA_ARCHS)
+  set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+    list(APPEND CMAKE_CUDA_ARCHITECTURES 120)
+  endif()
+endif()
+message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 # FFmpeg - Prioritize vcpkg, fallback to manual C:/ffmpeg
 find_package(PkgConfig)
@@ -135,8 +151,10 @@ set(NV_CODEC_SDK_INCLUDE "${NV_CODEC_SDK_ROOT}/include")
 if(EXISTS "${NV_CODEC_SDK_ROOT}/Interface")
   list(APPEND NV_CODEC_SDK_INCLUDE "${NV_CODEC_SDK_ROOT}/Interface")
 endif()
-# Lib directory (Windows x64)
-if(EXISTS "${NV_CODEC_SDK_ROOT}/Lib/x64")
+# Lib directory (Windows x64). Codec SDK 13.x uses Lib/win/x64; older = Lib/x64.
+if(EXISTS "${NV_CODEC_SDK_ROOT}/Lib/win/x64")
+  set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/Lib/win/x64")
+elseif(EXISTS "${NV_CODEC_SDK_ROOT}/Lib/x64")
   set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/Lib/x64")
 elseif(EXISTS "${NV_CODEC_SDK_ROOT}/lib/x64")
   set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/lib/x64")
