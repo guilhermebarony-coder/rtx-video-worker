@@ -2,6 +2,7 @@
 #include "logger.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1230,7 +1231,8 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     // Command-line flags will override these
     cfg->rtxCfg.enableVSR = !get_env_bool("RTX_NO_VSR", false);
     cfg->rtxCfg.vsrYuvRestore = !get_env_bool("RTX_NO_VSR_YUV_RESTORE", false);
-    cfg->rtxCfg.scaleFactor = get_env_int("RTX_VSR_SCALE", 2);
+    // Same 1..4 clamp as the --vsr-scale CLI path
+    cfg->rtxCfg.scaleFactor = std::min(4, std::max(1, get_env_int("RTX_VSR_SCALE", 2)));
     cfg->rtxCfg.vsrQuality = get_env_int("RTX_VSR_QUALITY", 4);
 
     cfg->rtxCfg.enableTHDR = !get_env_bool("RTX_NO_THDR", false);

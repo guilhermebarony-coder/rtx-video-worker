@@ -11,7 +11,11 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Target NVIDIA RTX architectures: 75=Turing(20), 86=Ampere(30), 89=Ada(40),
 # 120=Blackwell(50, e.g. RTX 5080 — needs CUDA Toolkit >= 12.8).
-set(CMAKE_CUDA_ARCHITECTURES 75 86 89 120)
+# Overridable (-DRTX_CUDA_ARCHS="75;86;89") so RTX 20-40 builds work on
+# Toolkits older than 12.8, where arch 120 is unknown to nvcc.
+set(RTX_CUDA_ARCHS "75;86;89;120" CACHE STRING
+    "CUDA architectures to compile for (semicolon-separated)")
+set(CMAKE_CUDA_ARCHITECTURES ${RTX_CUDA_ARCHS})
 
 # Use static MSVC runtime (/MT for Release, /MTd for Debug)
 # Requires CMake >= 3.15; this project requires 3.24 at top, so it's safe.

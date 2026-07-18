@@ -683,11 +683,10 @@ int run_pipeline(PipelineConfig cfg)
         // compensation queue, no EOF flush stimulus: process(k) -> emit(k),
         // strictly 1:1.
 
-        // Emit one processed output, attaching the props        // Emit one processed output, attaching the props of the input that ACTUALLY
-        // produced this content (dequeued by the caller), not the live input frame.
-        // Identical PTS/CFR/encode path as before — only `decframe` becomes `props`,
-        // drops `return` instead of `continue`, and no per-frame unref (the caller
-        // owns the decoded frame). On encode failure it throws (propagated).
+        // Emit one processed output, attaching the props (PTS/duration/side
+        // data) of the decoded frame that produced it. With depth 0 that is
+        // always the live decoded frame. On encode failure it throws
+        // (propagated); the caller owns the decoded frame.
         auto emit_processed_output = [&](AVFrame *outFrame, AVFrame *props)
         {
             copy_frame_hdr_side_data(props, outFrame);
@@ -848,10 +847,8 @@ int run_pipeline(PipelineConfig cfg)
                     continue;
                 }
 
-                // Submit to the processor (Step 3): enqueue this input's props,
-                // apply the measured RTX-evaluate latency compensation, and emit the
-                // matching (delayed) output. All PTS/CFR/encode logic now lives in
-                // emit_processed_output, keyed on the correct input's props.
+                // Process and emit (1:1, depth 0). All PTS/CFR/encode logic
+                // lives in emit_processed_output, keyed on this input's props.
                 submit_to_processor(decframe);
                 av_frame_unref(frame.get());
                 if (swframe)
@@ -1066,13 +1063,6 @@ int run_pipeline(PipelineConfig cfg)
         pump_video_decoder(nullptr);
 
     done_processing:
-        // Step 3: flush the RTX-evaluate pipeline so the stuck last frame(s) are
-        // emitted before the encoder flush. Reached both by normal EOF (after the
-        // decoder drain above) and by the duration-limit goto — in either case the
-        // in-flight frames were submitted within the requested range.
-
-
-
         // Flush encoder (uses encode_and_write to ensure DTS monotonicity fix is applied)
         LOG_DEBUG("Finished processing all frames, flushing encoder...");
         encode_and_write(out.venc, out.vstream, out.fmt, out, nullptr, opkt, "flush encoder");
