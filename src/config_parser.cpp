@@ -1231,8 +1231,7 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     // Command-line flags will override these
     cfg->rtxCfg.enableVSR = !get_env_bool("RTX_NO_VSR", false);
     cfg->rtxCfg.vsrYuvRestore = !get_env_bool("RTX_NO_VSR_YUV_RESTORE", false);
-    // Same 1..4 clamp as the --vsr-scale CLI path
-    cfg->rtxCfg.scaleFactor = std::min(4, std::max(1, get_env_int("RTX_VSR_SCALE", 2)));
+    cfg->rtxCfg.scaleFactor = get_env_int("RTX_VSR_SCALE", 2);
     cfg->rtxCfg.vsrQuality = get_env_int("RTX_VSR_QUALITY", 4);
 
     cfg->rtxCfg.enableTHDR = !get_env_bool("RTX_NO_THDR", false);
@@ -1278,4 +1277,11 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
         // Simple mode (positional input/output)
         parse_simple_mode(argc, argv, cfg);
     }
+
+    // Single validation contract, applied AFTER every override source
+    // (env defaults, then CLI): the effective VSR scale is always 1..4,
+    // no matter which path set it. Output dims and allocations derive
+    // from this value, so an unclamped 0/negative/huge scale would mean
+    // invalid dimensions or absurd VRAM pressure.
+    cfg->rtxCfg.scaleFactor = std::min(4, std::max(1, cfg->rtxCfg.scaleFactor));
 }
