@@ -17,3 +17,10 @@ nvngx_*.dll
 av*.dll
 sw*.dll
 postproc*.dll
+# all out-of-tree build dirs (contain proprietary nvngx DLLs + exe)
+build-*/
+# scratch build/probe scripts
+*.bat
+offprobe*
+ngx_smoke*
+MEDIAHUB_FORK_NOTES.md

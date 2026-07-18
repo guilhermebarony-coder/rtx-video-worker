@@ -1,8 +1,13 @@
 #include "rtx_processor.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <windows.h>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -55,6 +60,12 @@ bool RTXProcessor::initialize(int gpuIndex, const RTXProcessConfig &cfg, uint32_
         setError("initCuda failed (check NVIDIA driver and CUDA installation)");
         return false;
     }
+    if (!m_stream && cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking) != cudaSuccess)
+    {
+        m_stream = nullptr;
+        setError("cudaStreamCreateWithFlags failed");
+        return false;
+    }
     if (!createRTX(cfg.enableTHDR, cfg.enableVSR))
     {
         setError(std::string("RTX API create failed (THDR=") + (cfg.enableTHDR ? "1" : "0") + ", VSR=" + (cfg.enableVSR ? "1" : "0") + ")");
@@ -99,15 +110,8 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
 
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
-    // Interpret the input using its native colorspace (bt2020 indicates input colorspace)
-    // 1) NV12 (device) -> BGRA8 (device pitched)
-    launch_nv12_to_bgra(d_y, pitchY, d_uv, pitchUV,
-                        m_devBGRA, (int)m_devBGRAPitch,
-                        (int)m_srcW, (int)m_srcH,
-                        bt2020,
-                        m_stream);
-
-    // If both VSR and THDR are disabled, bypass RTX evaluate and convert directly to P010
+    // TRUE BYPASS (OOG fix, 2026-07-17): VSR+THDR off -> pure YUV
+    // upshift NV12->P010 (v<<8), no RGB round-trip (see NV12ToNV12).
     if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
     {
         uint8_t *d_outY = encP010Frame->data[0];
@@ -119,17 +123,22 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
             setError("processGpuNV12ToP010: invalid encoder CUDA frame planes");
             return false;
         }
-        // Direct BGRA8 -> P010 using input colorspace
-        launch_bgra8_to_p010(m_devBGRA, (int)m_devBGRAPitch,
-                             d_outY, pitchOutY,
-                             d_outUV, pitchOutUV,
-                             (int)m_srcW, (int)m_srcH,
-                             /*bt2020=*/bt2020,
-                             m_stream);
-
+        launch_nv12_to_p010(d_y, pitchY, d_uv, pitchUV,
+                            d_outY, pitchOutY,
+                            d_outUV, pitchOutUV,
+                            (int)m_srcW, (int)m_srcH,
+                            m_stream);
         cudaStreamSynchronize(m_stream);
         return true;
     }
+
+    // Interpret the input using its native colorspace (bt2020 indicates input colorspace)
+    // 1) NV12 (device) -> BGRA8 (device pitched)
+    launch_nv12_to_bgra(d_y, pitchY, d_uv, pitchUV,
+                        m_devBGRA, (int)m_devBGRAPitch,
+                        (int)m_srcW, (int)m_srcH,
+                        bt2020,
+                        m_stream);
 
     // 2) Copy BGRA8 (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
@@ -140,7 +149,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     copyIn.dstArray = m_srcArray;
     copyIn.WidthInBytes = (unsigned int)(m_srcW * 4);
     copyIn.Height = m_srcH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyIn, m_stream));
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when THDR enabled)
     API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
@@ -171,7 +180,7 @@ bool RTXProcessor::processGpuNV12ToP010(const uint8_t *d_y, int pitchY,
     copyOut.dstPitch = (unsigned int)m_devABGR10Pitch;
     copyOut.WidthInBytes = (unsigned int)(m_dstW * 4);
     copyOut.Height = m_dstH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyOut, m_stream));
 
     // 5) Convert RTX output to P010 directly into FFmpeg CUDA frame planes
     uint8_t *d_outY = encP010Frame->data[0];
@@ -224,17 +233,8 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
 
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
-    // 1) P010 (device) -> X2BGR10LE (10-bit RGB, device pitched) - preserving full 10-bit precision
-    // IMPORTANT: Use m_devBGRA (source-sized buffer) for input conversion, NOT m_devABGR10 (dest-sized).
-    // Using dest-sized buffer for source data causes overlay artifacts when VSR upscales,
-    // because the source data only fills a portion of the buffer and stale data remains.
-    launch_p010_to_x2bgr10(d_y, pitchY, d_uv, pitchUV,
-                           m_devBGRA, (int)m_devBGRAPitch, // Use source-sized buffer
-                           (int)m_srcW, (int)m_srcH,
-                           bt2020,
-                           m_stream);
-
-    // If both VSR and THDR are disabled, bypass RTX evaluate and convert directly to P010
+    // TRUE BYPASS (OOG fix, 2026-07-17): VSR+THDR off -> copy P010
+    // planes directly (u16 layout identical), no RGB round-trip.
     if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
     {
         uint8_t *d_outY = encP010Frame->data[0];
@@ -246,17 +246,38 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
             setError("processGpuP010ToP010: invalid encoder CUDA frame planes");
             return false;
         }
-        // Direct X2BGR10LE -> P010 preserving 10-bit precision with BT.2020 colorspace
-        launch_abgr10_to_p010(m_devBGRA, (int)m_devBGRAPitch,
-                              d_outY, pitchOutY,
-                              d_outUV, pitchOutUV,
-                              (int)m_srcW, (int)m_srcH,
-                              /*bt2020=*/true, // Always use BT.2020 for HDR content
-                              m_stream);
-
-        cudaStreamSynchronize(m_stream);
+        CUDA_MEMCPY2D cpY{};
+        cpY.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpY.srcDevice = (CUdeviceptr)d_y;
+        cpY.srcPitch = (unsigned int)pitchY;
+        cpY.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpY.dstDevice = (CUdeviceptr)d_outY;
+        cpY.dstPitch = (unsigned int)pitchOutY;
+        cpY.WidthInBytes = (unsigned int)(m_srcW * 2);   // u16 samples
+        cpY.Height = m_srcH;
+        CUDADRV_CHECK(cuMemcpy2D(&cpY));
+        CUDA_MEMCPY2D cpUV{};
+        cpUV.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpUV.srcDevice = (CUdeviceptr)d_uv;
+        cpUV.srcPitch = (unsigned int)pitchUV;
+        cpUV.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpUV.dstDevice = (CUdeviceptr)d_outUV;
+        cpUV.dstPitch = (unsigned int)pitchOutUV;
+        cpUV.WidthInBytes = (unsigned int)(m_srcW * 2);  // u16 interleaved UV
+        cpUV.Height = m_srcH / 2;
+        CUDADRV_CHECK(cuMemcpy2D(&cpUV));
         return true;
     }
+
+    // 1) P010 (device) -> X2BGR10LE (10-bit RGB, device pitched) - preserving full 10-bit precision
+    // IMPORTANT: Use m_devBGRA (source-sized buffer) for input conversion, NOT m_devABGR10 (dest-sized).
+    // Using dest-sized buffer for source data causes overlay artifacts when VSR upscales,
+    // because the source data only fills a portion of the buffer and stale data remains.
+    launch_p010_to_x2bgr10(d_y, pitchY, d_uv, pitchUV,
+                           m_devBGRA, (int)m_devBGRAPitch, // Use source-sized buffer
+                           (int)m_srcW, (int)m_srcH,
+                           bt2020,
+                           m_stream);
 
     // 2) Copy X2BGR10LE (device pitched) -> m_srcArray (CUDA array) for RTX input
     CUDA_MEMCPY2D copyIn{};
@@ -267,7 +288,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     copyIn.dstArray = m_srcArray;
     copyIn.WidthInBytes = (unsigned int)(m_srcW * 4); // 4 bytes per pixel for X2BGR10LE
     copyIn.Height = m_srcH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyIn, m_stream));
 
     // 3) RTX evaluate: m_srcTex -> m_dstSurf (ABGR10 when processing HDR content)
     API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
@@ -298,7 +319,7 @@ bool RTXProcessor::processGpuP010ToP010(const uint8_t *d_y, int pitchY,
     copyOut.dstPitch = (unsigned int)m_devABGR10Pitch;
     copyOut.WidthInBytes = (unsigned int)(m_dstW * 4);
     copyOut.Height = m_dstH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyOut, m_stream));
 
     // 5) ABGR10 (device pitched) -> P010 (encoder frame planes)
     uint8_t *d_outY = encP010Frame->data[0];
@@ -393,7 +414,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
     copyIn.dstArray = m_srcArray;
     copyIn.WidthInBytes = (unsigned int)(m_srcW * 4);
     copyIn.Height = m_srcH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyIn, m_stream));
 
     // Step 4: RTX evaluate: m_srcTex -> m_dstSurf (BGRA8 for SDR output)
     API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
@@ -419,7 +440,7 @@ bool RTXProcessor::processGpuP010ToNV12(const uint8_t *d_y, int pitchY,
     copyOut.dstPitch = (unsigned int)m_devABGR10Pitch;
     copyOut.WidthInBytes = (unsigned int)(m_dstW * 4);
     copyOut.Height = m_dstH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyOut, m_stream));
 
     // Step 6: BGRA8 -> NV12 (output)
     launch_bgra8_to_nv12(m_devABGR10, (int)m_devABGR10Pitch,
@@ -476,7 +497,17 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
                                         AVFrame *encNV12Frame,
                                         bool bt2020)
 {
-    if (!m_initialized || !d_y || !d_uv || !encNV12Frame)
+    if (!encNV12Frame || !encNV12Frame->data[0] || !encNV12Frame->data[1]
+        || encNV12Frame->linesize[0] <= 0 || encNV12Frame->linesize[1] <= 0)
+    {
+        setError("processGpuNV12ToNV12: invalid encoder CUDA frame planes");
+        return false;
+    }
+    uint8_t *outY = encNV12Frame->data[0];
+    int outPitchY = encNV12Frame->linesize[0];
+    uint8_t *outUV = encNV12Frame->data[1];
+    int outPitchUV = encNV12Frame->linesize[1];
+    if (!m_initialized || !d_y || !d_uv)
     {
         setError("processGpuNV12ToNV12: invalid state or null args");
         return false;
@@ -484,36 +515,47 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
 
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
 
+    // TRUE BYPASS (OOG fix, 2026-07-17): with VSR and THDR both off and
+    // src==dst dims, copy NV12 planes decoder->encoder directly. The old
+    // path went NV12->BGRA8->NV12; the RGB conversion hard-clamps to
+    // [0,1] and destroys legal out-of-gamut YUV (audited: OOG patches
+    // e.g. 235/180/180 -> 211/141/144; real content dY median -4.75).
+    // No RGB, no scale, no pack when nothing changes.
+    if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
+    {
+        uint8_t *d_outY = outY;
+        uint8_t *d_outUV = outUV;
+        int pitchOutY = outPitchY;
+        int pitchOutUV = outPitchUV;
+        CUDA_MEMCPY2D cpY{};
+        cpY.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpY.srcDevice = (CUdeviceptr)d_y;
+        cpY.srcPitch = (unsigned int)pitchY;
+        cpY.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpY.dstDevice = (CUdeviceptr)d_outY;
+        cpY.dstPitch = (unsigned int)pitchOutY;
+        cpY.WidthInBytes = (unsigned int)m_srcW;
+        cpY.Height = m_srcH;
+        CUDADRV_CHECK(cuMemcpy2D(&cpY));
+        CUDA_MEMCPY2D cpUV{};
+        cpUV.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpUV.srcDevice = (CUdeviceptr)d_uv;
+        cpUV.srcPitch = (unsigned int)pitchUV;
+        cpUV.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        cpUV.dstDevice = (CUdeviceptr)d_outUV;
+        cpUV.dstPitch = (unsigned int)pitchOutUV;
+        cpUV.WidthInBytes = (unsigned int)m_srcW;      // NV12: UV interleaved, W bytes
+        cpUV.Height = m_srcH / 2;
+        CUDADRV_CHECK(cuMemcpy2D(&cpUV));
+        return true;
+    }
+
     // NV12 -> BGRA8 (device)
     launch_nv12_to_bgra(d_y, pitchY, d_uv, pitchUV,
                         m_devBGRA, (int)m_devBGRAPitch,
                         (int)m_srcW, (int)m_srcH,
                         bt2020,
                         m_stream);
-
-    // If both VSR and THDR are disabled, bypass RTX evaluate and convert directly to NV12
-    if (!m_cfg.enableVSR && !m_cfg.enableTHDR)
-    {
-        uint8_t *d_outY = encNV12Frame->data[0];
-        uint8_t *d_outUV = encNV12Frame->data[1];
-        int pitchOutY = encNV12Frame->linesize[0];
-        int pitchOutUV = encNV12Frame->linesize[1];
-        if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
-        {
-            setError("processGpuNV12ToNV12: invalid encoder CUDA frame planes");
-            return false;
-        }
-        // Direct BGRA8 -> NV12 using input colorspace
-        launch_bgra8_to_nv12(m_devBGRA, (int)m_devBGRAPitch,
-                             d_outY, pitchOutY,
-                             d_outUV, pitchOutUV,
-                             (int)m_srcW, (int)m_srcH,
-                             /*bt2020=*/bt2020,
-                             m_stream);
-
-        cudaStreamSynchronize(m_stream);
-        return true;
-    }
 
     // Copy BGRA8 -> m_srcArray for RTX input
     CUDA_MEMCPY2D copyIn{};
@@ -524,7 +566,7 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
     copyIn.dstArray = m_srcArray;
     copyIn.WidthInBytes = (unsigned int)(m_srcW * 4);
     copyIn.Height = m_srcH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyIn, m_stream));
 
     // RTX evaluate (BGRA8 in, BGRA8 or ABGR10 out depending on THDR)
     API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
@@ -554,18 +596,68 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
     copyOut.dstPitch = (unsigned int)m_devABGR10Pitch;
     copyOut.WidthInBytes = (unsigned int)(m_dstW * 4);
     copyOut.Height = m_dstH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyOut, m_stream));
 
     // Convert to NV12 into FFmpeg CUDA frame planes
-    uint8_t *d_outY = encNV12Frame->data[0];
-    uint8_t *d_outUV = encNV12Frame->data[1];
-    int pitchOutY = encNV12Frame->linesize[0];
-    int pitchOutUV = encNV12Frame->linesize[1];
-    if (!d_outY || !d_outUV || pitchOutY <= 0 || pitchOutUV <= 0)
+    uint8_t *d_outY = outY;
+    uint8_t *d_outUV = outUV;
+    int pitchOutY = outPitchY;
+    int pitchOutUV = outPitchUV;
+
+    // OOG fix #2 — RESIDUAL RECONSTRUCTION (SDR VSR path): the RGB
+    // round-trip that feeds the network clamps out-of-gamut YUV
+    // (audited: real content dY median -4.75). The SDK only accepts
+    // RGB, so instead of trusting its color base we keep only the
+    // network's DETAIL:
+    //   base = bicubicYUV(NV12(clipped src RGB))   [same roundtrip]
+    //   out  = bicubicYUV(true src YUV) + (VSR_out - base)
+    // The clip is common to VSR_out and base, so it cancels; colors
+    // come from the true YUV. Catmull-Rom (B=0, C=0.5) both scalers.
+    if (m_cfg.vsrYuvRestore && !m_cfg.enableTHDR &&
+        m_devVsrY && m_devBaseY && m_devNatY)
     {
-        setError("processGpuNV12ToNV12: invalid encoder CUDA frame planes");
-        return false;
+        // 1) VSR output (clipped-RGB domain) -> NV12 dst-size
+        launch_bgra8_to_nv12(m_devABGR10, (int)m_devABGR10Pitch,
+                             m_devVsrY, (int)m_devVsrYPitch,
+                             m_devVsrUV, (int)m_devVsrUVPitch,
+                             (int)m_dstW, (int)m_dstH,
+                             /*bt2020=*/bt2020, m_stream);
+        // 2) baseline: clipped src RGB -> NV12 (src size, temp bufs)
+        //    -> bicubic to dst size
+        launch_bgra8_to_nv12(m_devBGRA, (int)m_devBGRAPitch,
+                             m_devTempY, (int)m_devTempYPitch,
+                             m_devTempUV, (int)m_devTempUVPitch,
+                             (int)m_srcW, (int)m_srcH,
+                             /*bt2020=*/bt2020, m_stream);
+        launch_bicubic_scale_nv12(m_devTempY, (int)m_devTempYPitch,
+                                  m_devTempUV, (int)m_devTempUVPitch,
+                                  (int)m_srcW, (int)m_srcH,
+                                  m_devBaseY, (int)m_devBaseYPitch,
+                                  m_devBaseUV, (int)m_devBaseUVPitch,
+                                  (int)m_dstW, (int)m_dstH,
+                                  0.0f, 0.5f, m_stream);
+        // 3) native: TRUE YUV (OOG intact) bicubic to dst size
+        launch_bicubic_scale_nv12(d_y, pitchY, d_uv, pitchUV,
+                                  (int)m_srcW, (int)m_srcH,
+                                  m_devNatY, (int)m_devNatYPitch,
+                                  m_devNatUV, (int)m_devNatUVPitch,
+                                  (int)m_dstW, (int)m_dstH,
+                                  0.0f, 0.5f, m_stream);
+        // 4) combine into encoder planes (Y, then interleaved UV)
+        launch_residual_combine(m_devNatY, (int)m_devNatYPitch,
+                                m_devVsrY, (int)m_devVsrYPitch,
+                                m_devBaseY, (int)m_devBaseYPitch,
+                                d_outY, pitchOutY,
+                                (int)m_dstW, (int)m_dstH, m_stream);
+        launch_residual_combine(m_devNatUV, (int)m_devNatUVPitch,
+                                m_devVsrUV, (int)m_devVsrUVPitch,
+                                m_devBaseUV, (int)m_devBaseUVPitch,
+                                d_outUV, pitchOutUV,
+                                (int)m_dstW, (int)m_dstH / 2, m_stream);
+        cudaStreamSynchronize(m_stream);
+        return true;
     }
+
     // For SDR output use BT.709; if input was BT.2020 but THDR disabled, we still use the input's matrix for colorimetry conversion to SDR YUV.
     launch_bgra8_to_nv12(m_devABGR10, (int)m_devABGR10Pitch,
                          d_outY, pitchOutY,
@@ -592,6 +684,18 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
     m_ctx = externalCtx;
     m_externalCtx = true;
     CUDADRV_CHECK(cuCtxSetCurrent(m_ctx));
+    // ORDERING FIX (Sol, 2026-07-18 — the smoking gun): the stream MUST
+    // exist BEFORE createRTX so the NGX binds to it. The old order handed
+    // InCUStream=nullptr (stream 0) to the SDK while every worker kernel
+    // and sync ran on this later non-blocking stream, which by contract
+    // has NO implicit ordering with stream 0 — the whole dup family.
+    if (!m_stream && cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking) != cudaSuccess)
+    {
+        m_stream = nullptr;
+        setError("cudaStreamCreateWithFlags failed");
+        return false;
+    }
+
     if (!createRTX(cfg.enableTHDR, cfg.enableVSR))
     {
         setError(std::string("RTX API create failed (THDR=") + (cfg.enableTHDR ? "1" : "0") + ", VSR=" + (cfg.enableVSR ? "1" : "0") + ")");
@@ -606,9 +710,7 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
         return false;
     }
 
-    // Create stream
-    if (!m_stream)
-        cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking);
+    // (stream created above, before createRTX — ordering fix)
 
     // Allocate device staging buffers
     size_t pitch = 0;
@@ -639,6 +741,28 @@ bool RTXProcessor::initializeWithContext(CUcontext externalCtx, const RTXProcess
     }
     m_devTempUVPitch = pitch;
 
+    // OOG fix #2: dst-size NV12 buffers for VSR residual reconstruction
+    if (m_cfg.enableVSR && m_cfg.vsrYuvRestore)
+    {
+        struct { uint8_t **p; size_t *pt; size_t w, h; const char *nm; } bufs[] = {
+            {&m_devVsrY, &m_devVsrYPitch, m_dstW, m_dstH, "m_devVsrY"},
+            {&m_devVsrUV, &m_devVsrUVPitch, m_dstW, m_dstH / 2, "m_devVsrUV"},
+            {&m_devBaseY, &m_devBaseYPitch, m_dstW, m_dstH, "m_devBaseY"},
+            {&m_devBaseUV, &m_devBaseUVPitch, m_dstW, m_dstH / 2, "m_devBaseUV"},
+            {&m_devNatY, &m_devNatYPitch, m_dstW, m_dstH, "m_devNatY"},
+            {&m_devNatUV, &m_devNatUVPitch, m_dstW, m_dstH / 2, "m_devNatUV"},
+        };
+        for (auto &b : bufs)
+        {
+            if (cudaMallocPitch(b.p, &pitch, b.w, b.h) != cudaSuccess)
+            {
+                setError(std::string("cudaMallocPitch ") + b.nm + " failed");
+                return false;
+            }
+            *b.pt = pitch;
+        }
+    }
+
     m_initialized = true;
     return true;
 }
@@ -659,7 +783,7 @@ bool RTXProcessor::process(const uint8_t *inBGRA, size_t inPitchBytes,
     copyIn.dstPitch = 0;
     copyIn.WidthInBytes = m_inPitch;
     copyIn.Height = m_srcH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyIn));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyIn, m_stream));
 
     API_RECT srcRect{0u, 0u, (uint32_t)m_srcW, (uint32_t)m_srcH};
     API_RECT dstRect{0u, 0u, (uint32_t)m_dstW, (uint32_t)m_dstH};
@@ -688,7 +812,7 @@ bool RTXProcessor::process(const uint8_t *inBGRA, size_t inPitchBytes,
     copyOut.dstPitch = (unsigned int)m_outPitch;
     copyOut.WidthInBytes = (unsigned int)m_outPitch;
     copyOut.Height = m_dstH;
-    CUDADRV_CHECK(cuMemcpy2D(&copyOut));
+    CUDADRV_CHECK(cuMemcpy2DAsync(&copyOut, m_stream));
 
     // Synchronize to ensure copy is complete before returning host data
     if (m_stream)
@@ -864,6 +988,14 @@ void RTXProcessor::freeSurfaces()
         m_devTempUV = nullptr;
         m_devTempUVPitch = 0;
     }
+    // OOG fix #2 buffers
+    for (uint8_t **p : {&m_devVsrY, &m_devVsrUV, &m_devBaseY,
+                        &m_devBaseUV, &m_devNatY, &m_devNatUV})
+    {
+        if (*p) { cudaFree(*p); *p = nullptr; }
+    }
+    m_devVsrYPitch = m_devVsrUVPitch = m_devBaseYPitch = 0;
+    m_devBaseUVPitch = m_devNatYPitch = m_devNatUVPitch = 0;
 
     if (m_ctx)
     {

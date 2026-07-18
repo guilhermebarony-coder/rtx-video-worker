@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <vector>
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
@@ -673,6 +674,192 @@ int run_pipeline(PipelineConfig cfg)
             }
         }
 
+        // ORDERING FIX (2026-07-18): with the NGX bound to m_stream and the
+        // whole frame chain on one dependency line, evaluate(k)'s result is
+        // complete at the trailing stream sync — measured pipeline depth is 0
+        // in ALL modes (bypass/vsr/thdr/vsr+thdr). The historical "warm-up +
+        // 1-frame lag" was an artifact of the stream misordering (NGX bound
+        // to stream 0, worker kernels on a non-blocking stream). No
+        // compensation queue, no EOF flush stimulus: process(k) -> emit(k),
+        // strictly 1:1.
+
+        // Emit one processed output, attaching the props        // Emit one processed output, attaching the props of the input that ACTUALLY
+        // produced this content (dequeued by the caller), not the live input frame.
+        // Identical PTS/CFR/encode path as before — only `decframe` becomes `props`,
+        // drops `return` instead of `continue`, and no per-frame unref (the caller
+        // owns the decoded frame). On encode failure it throws (propagated).
+        auto emit_processed_output = [&](AVFrame *outFrame, AVFrame *props)
+        {
+            copy_frame_hdr_side_data(props, outFrame);
+
+            bool cfr_active = (cfg.vsync == "cfr" || cfg.vsync == "0");
+            if (cfr_active && ts_manager.cfrActive())
+            {
+                int64_t in_pts = (props->pts != AV_NOPTS_VALUE) ? props->pts : props->best_effort_timestamp;
+                if (in_pts == AV_NOPTS_VALUE)
+                {
+                    outFrame->pts = ts_manager.deriveVideoPTS(props, in.vst->time_base, out.venc->time_base);
+                    if (outFrame->pts == AV_NOPTS_VALUE)
+                        return;
+                    int64_t tpf = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                    if (tpf <= 0) tpf = 1;
+                    outFrame->duration = (int)tpf;
+                    if (use_cuda_path)
+                        rtx.syncStream();
+                    encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
+                }
+                else
+                {
+                    int64_t normalized_pts = ts_manager.deriveVideoPTS(props, in.vst->time_base, out.venc->time_base);
+                    if (normalized_pts == AV_NOPTS_VALUE)
+                        return;
+                    AVFrame temp_frame = *props;
+                    temp_frame.pts = normalized_pts;
+                    temp_frame.time_base = out.venc->time_base;
+                    int64_t cfr_pts;
+                    double cfr_duration;
+                    int64_t nb_frames = ts_manager.cfrSync(&temp_frame, out.venc->time_base, out.venc->time_base, &cfr_pts, &cfr_duration);
+                    if (nb_frames == 0)
+                        return;
+                    int64_t duration_ticks = (int64_t)llrint(cfr_duration);
+                    if (duration_ticks <= 0) duration_ticks = 1;
+                    AVRational cfr_tb = av_inv_q(fr);
+                    for (int64_t i = 0; i < nb_frames; i++)
+                    {
+                        int64_t encoder_pts = av_rescale_q(cfr_pts + i, cfr_tb, out.venc->time_base);
+                        outFrame->pts = encoder_pts;
+                        outFrame->duration = duration_ticks;
+                        if (use_cuda_path)
+                            rtx.syncStream();
+                        encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send CFR frame to encoder");
+                    }
+                }
+            }
+            else
+            {
+                outFrame->pts = ts_manager.deriveVideoPTS(props, in.vst->time_base, out.venc->time_base);
+                if (outFrame->pts == AV_NOPTS_VALUE)
+                    return;
+                int64_t frame_duration;
+                if (props->duration > 0)
+                    frame_duration = av_rescale_q(props->duration, in.vst->time_base, out.venc->time_base);
+                else
+                    frame_duration = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
+                if (frame_duration <= 0) frame_duration = 1;
+                outFrame->duration = frame_duration;
+                if (use_cuda_path)
+                    rtx.syncStream();
+                encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
+            }
+        };
+
+        // Submit one decoded frame: process -> emit, keyed on the live
+        // decoded frame (depth 0 — see the ordering fix above).
+        auto submit_to_processor = [&](AVFrame *decframe)
+        {
+            AVFrame *outFrame = nullptr;
+            if (!processor->process(decframe, outFrame))
+                throw std::runtime_error("Processor failed to produce output frame");
+            processed_frames++;
+            show_progress();
+            emit_processed_output(outFrame, decframe);
+        };
+
+        // Shared video-decoder pump        // Shared video-decoder pump — used by the main packet loop and (added in
+        // a later step) the EOF drain. Faithful extraction of the former inline
+        // send/receive/process body: logic, order, timestamps and error handling
+        // are unchanged; the ONLY content change is the duration-limit
+        // `goto done_processing` becoming `return false` (the caller performs the
+        // goto, since goto cannot cross a lambda). Pass a real packet to decode it,
+        // or nullptr to flush/drain the decoder at EOF.
+        auto pump_video_decoder = [&](AVPacket *vpkt) -> bool
+        {
+            ff_check(avcodec_send_packet(in.vdec, vpkt), "send packet");
+            if (vpkt)
+                av_packet_unref(pkt.get());
+
+            while (true)
+            {
+                int ret = avcodec_receive_frame(in.vdec, frame.get());
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                    break;
+                ff_check(ret, "receive frame");
+
+                AVFrame *decframe = frame.get();
+
+                // Accurate seeking: Discard frames before seek target (only if accurate seek is enabled)
+                // When seeking to a timestamp, avformat_seek_file() seeks to the nearest keyframe BEFORE the target.
+                // The decoder then outputs all frames from that keyframe onwards.
+                // FFmpeg's default behavior (accurate_seek) is to decode but discard frames before the target.
+                // Respect user's -noaccurate_seek or -seek2any flags - don't discard if they disabled accurate seeking.
+                int64_t frame_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
+                if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && frame_pts != AV_NOPTS_VALUE)
+                {
+                    int64_t frame_time_us = av_rescale_q(frame_pts, in.vst->time_base, {1, AV_TIME_BASE});
+                    if (frame_time_us < in.seek_offset_us)
+                    {
+                        // Frame is before seek target - discard it (accurate seeking behavior)
+                        av_frame_unref(frame.get());
+                        continue;
+                    }
+                }
+
+                // Duration limit: Stop processing when we've reached the requested duration
+                if (duration_us > 0 && frame_pts != AV_NOPTS_VALUE)
+                {
+                    // Convert frame PTS to microseconds (reuse frame_pts from above)
+                    int64_t frame_time_us = av_rescale_q(frame_pts, in.vst->time_base, {1, 1000000});
+
+                    // Calculate elapsed time from start
+                    // FFmpeg behavior: With output seeking (-ss after -i), duration is measured from
+                    // the output seek point, not the input seek point. This ensures proper clip duration.
+                    int64_t reference_time_us = ts_config.output_seek_target_us > 0
+                                                 ? ts_config.output_seek_target_us
+                                                 : in.seek_offset_us;
+                    int64_t elapsed_us = frame_time_us - reference_time_us;
+
+                    // Stop when we exceed the duration limit
+                    if (elapsed_us >= duration_us)
+                    {
+                        LOG_INFO("Reached duration limit: %.3fs (elapsed from %.3fs)",
+                                 elapsed_us / 1000000.0, reference_time_us / 1000000.0);
+                        return false;
+                    }
+                }
+
+                FramePtr tmp(nullptr, &av_frame_free_single);
+                bool frame_is_cuda = (decframe->format == AV_PIX_FMT_CUDA);
+                if (frame_is_cuda && !use_cuda_path)
+                {
+                    // Decoder produced CUDA but encoder path is CPU: transfer to SW
+                    if (!swframe)
+                        swframe.reset(av_frame_alloc());
+                    ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer");
+                    decframe = swframe.get();
+                    frame_is_cuda = false;
+                }
+
+                // Output seeking: Drop frames until target reached (handled by TimestampManager)
+                if (ts_manager.shouldDropFrameForOutputSeek(decframe, in.vst->time_base))
+                {
+                    av_frame_unref(frame.get());
+                    if (swframe)
+                        av_frame_unref(swframe.get());
+                    continue;
+                }
+
+                // Submit to the processor (Step 3): enqueue this input's props,
+                // apply the measured RTX-evaluate latency compensation, and emit the
+                // matching (delayed) output. All PTS/CFR/encode logic now lives in
+                // emit_processed_output, keyed on the correct input's props.
+                submit_to_processor(decframe);
+                av_frame_unref(frame.get());
+                if (swframe)
+                    av_frame_unref(swframe.get());
+            }
+            return true;
+        };
+
         int packet_count = 0;
         while (true)
         {
@@ -707,221 +894,10 @@ int run_pipeline(PipelineConfig cfg)
             // Process packets by type
             if (pkt->stream_index == in.vstream)
             {
-                ff_check(avcodec_send_packet(in.vdec, pkt.get()), "send packet");
-                av_packet_unref(pkt.get());
-
-                while (true)
-                {
-                    int ret = avcodec_receive_frame(in.vdec, frame.get());
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                        break;
-                    ff_check(ret, "receive frame");
-
-                    AVFrame *decframe = frame.get();
-
-                    // Accurate seeking: Discard frames before seek target (only if accurate seek is enabled)
-                    // When seeking to a timestamp, avformat_seek_file() seeks to the nearest keyframe BEFORE the target.
-                    // The decoder then outputs all frames from that keyframe onwards.
-                    // FFmpeg's default behavior (accurate_seek) is to decode but discard frames before the target.
-                    // Respect user's -noaccurate_seek or -seek2any flags - don't discard if they disabled accurate seeking.
-                    int64_t frame_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
-                    if (in.seek_offset_us > 0 && !cfg.noAccurateSeek && !cfg.seek2any && frame_pts != AV_NOPTS_VALUE)
-                    {
-                        int64_t frame_time_us = av_rescale_q(frame_pts, in.vst->time_base, {1, AV_TIME_BASE});
-                        if (frame_time_us < in.seek_offset_us)
-                        {
-                            // Frame is before seek target - discard it (accurate seeking behavior)
-                            av_frame_unref(frame.get());
-                            continue;
-                        }
-                    }
-
-                    // Duration limit: Stop processing when we've reached the requested duration
-                    if (duration_us > 0 && frame_pts != AV_NOPTS_VALUE)
-                    {
-                        // Convert frame PTS to microseconds (reuse frame_pts from above)
-                        int64_t frame_time_us = av_rescale_q(frame_pts, in.vst->time_base, {1, 1000000});
-
-                        // Calculate elapsed time from start
-                        // FFmpeg behavior: With output seeking (-ss after -i), duration is measured from
-                        // the output seek point, not the input seek point. This ensures proper clip duration.
-                        int64_t reference_time_us = ts_config.output_seek_target_us > 0
-                                                     ? ts_config.output_seek_target_us
-                                                     : in.seek_offset_us;
-                        int64_t elapsed_us = frame_time_us - reference_time_us;
-
-                        // Stop when we exceed the duration limit
-                        if (elapsed_us >= duration_us)
-                        {
-                            LOG_INFO("Reached duration limit: %.3fs (elapsed from %.3fs)",
-                                     elapsed_us / 1000000.0, reference_time_us / 1000000.0);
-                            goto done_processing;
-                        }
-                    }
-
-                    FramePtr tmp(nullptr, &av_frame_free_single);
-                    bool frame_is_cuda = (decframe->format == AV_PIX_FMT_CUDA);
-                    if (frame_is_cuda && !use_cuda_path)
-                    {
-                        // Decoder produced CUDA but encoder path is CPU: transfer to SW
-                        if (!swframe)
-                            swframe.reset(av_frame_alloc());
-                        ff_check(av_hwframe_transfer_data(swframe.get(), decframe, 0), "hwframe transfer");
-                        decframe = swframe.get();
-                        frame_is_cuda = false;
-                    }
-
-                    // Output seeking: Drop frames until target reached (handled by TimestampManager)
-                    if (ts_manager.shouldDropFrameForOutputSeek(decframe, in.vst->time_base))
-                    {
-                        av_frame_unref(frame.get());
-                        if (swframe)
-                            av_frame_unref(swframe.get());
-                        continue;
-                    }
-
-                    // Use unified processor
-                    AVFrame *outFrame = nullptr;
-                    if (!processor->process(decframe, outFrame))
-                    {
-                        // Processing failed; no runtime fallback by design
-                        throw std::runtime_error("Processor failed to produce output frame");
-                    }
-
-                    // Copy HDR side data from decoded frame to output frame
-                    // Preserves HDR10+, Dolby Vision, and per-frame mastering metadata
-                    copy_frame_hdr_side_data(decframe, outFrame);
-
-                    // Update progress prior to encoding
-                    processed_frames++;
-                    show_progress();
-
-                    bool cfr_active = (cfg.vsync == "cfr" || cfg.vsync == "0");
-                    if (cfr_active && ts_manager.cfrActive())
-                    {
-                        // Obtain input PTS
-                        int64_t in_pts = (decframe->pts != AV_NOPTS_VALUE) ? decframe->pts : decframe->best_effort_timestamp;
-                        if (in_pts == AV_NOPTS_VALUE)
-                        {
-                            // Fallback to previous behavior when no input PTS is available
-                            outFrame->pts = ts_manager.deriveVideoPTS(decframe, in.vst->time_base, out.venc->time_base);
-                            if (outFrame->pts == AV_NOPTS_VALUE)
-                            {
-                                av_frame_unref(frame.get());
-                                if (swframe)
-                                    av_frame_unref(swframe.get());
-                                continue;
-                            }
-                            // duration in CFR
-                            int64_t tpf = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
-                            if (tpf <= 0) tpf = 1;
-                            outFrame->duration = (int)tpf;
-
-                            // Encode current frame
-                            if (use_cuda_path)
-                                rtx.syncStream();
-                            encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
-                        }
-                        else
-                        {
-                            // CFR synchronization (FFmpeg-compliant delta-based approach)
-                            // IMPORTANT: Apply COPYTS baseline normalization BEFORE CFR sync
-                            // FFmpeg's CFR works with normalized timestamps (starting at 0), not raw input timestamps
-
-                            // First, get baseline-normalized PTS using deriveVideoPTS
-                            // This handles COPYTS baseline, output seeking, etc.
-                            int64_t normalized_pts = ts_manager.deriveVideoPTS(decframe, in.vst->time_base, out.venc->time_base);
-                            if (normalized_pts == AV_NOPTS_VALUE)
-                            {
-                                av_frame_unref(frame.get());
-                                if (swframe)
-                                    av_frame_unref(swframe.get());
-                                continue;
-                            }
-
-                            // Create a temporary frame with normalized PTS for CFR sync
-                            // CFR sync needs to see timestamps starting at ~0, not raw input timeline
-                            AVFrame temp_frame = *decframe;
-                            temp_frame.pts = normalized_pts;
-                            temp_frame.time_base = out.venc->time_base;
-
-                            int64_t cfr_pts;  // PTS in CFR timebase (av_inv_q(framerate))
-                            double cfr_duration;
-                            int64_t nb_frames = ts_manager.cfrSync(&temp_frame, out.venc->time_base, out.venc->time_base, &cfr_pts, &cfr_duration);
-
-                            if (nb_frames == 0)
-                            {
-                                // Drop frame (delta < -1.1 or below threshold)
-                                av_frame_unref(frame.get());
-                                if (swframe)
-                                    av_frame_unref(swframe.get());
-                                continue;
-                            }
-
-                            // Calculate duration in encoder timebase ticks
-                            int64_t duration_ticks = (int64_t)llrint(cfr_duration);
-                            if (duration_ticks <= 0) duration_ticks = 1;
-
-                            // CFR timebase: 1 tick = 1 frame (e.g., 21/500 for 500/21 fps)
-                            AVRational cfr_tb = av_inv_q(fr);
-
-                            // Output nb_frames times (1 for normal, >1 for duplication)
-                            for (int64_t i = 0; i < nb_frames; i++)
-                            {
-                                // Convert from CFR timebase to encoder timebase
-                                // FFmpeg equivalently uses filter output tb = av_inv_q(framerate)
-                                int64_t encoder_pts = av_rescale_q(cfr_pts + i, cfr_tb, out.venc->time_base);
-                                outFrame->pts = encoder_pts;
-                                outFrame->duration = duration_ticks;
-
-                                if (use_cuda_path)
-                                    rtx.syncStream();
-                                encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send CFR frame to encoder");
-                            }
-                        }
-
-                        // COPYTS: Each stream preserves its own timeline independently
-                        // No shared baseline needed - tfdt is per-stream in fMP4
-
-                        // Done with frames (already encoded above)
-                        av_frame_unref(frame.get());
-                        if (swframe)
-                            av_frame_unref(swframe.get());
-                        continue; // Skip the generic encode path below
-                    }
-                    else
-                    {
-                        // Non-CFR: previous behavior
-                        outFrame->pts = ts_manager.deriveVideoPTS(decframe, in.vst->time_base, out.venc->time_base);
-                        if (outFrame->pts == AV_NOPTS_VALUE)
-                        {
-                            av_frame_unref(frame.get());
-                            if (swframe)
-                                av_frame_unref(swframe.get());
-                            continue;
-                        }
-
-                        // Set frame duration from framerate (FFmpeg-compliant behavior)
-                        // Prefer per-frame duration from decoder for VFR content, fallback to fixed duration
-                        int64_t frame_duration;
-                        if (decframe->duration > 0) {
-                            // Use decoder's per-frame duration (handles VFR correctly)
-                            frame_duration = av_rescale_q(decframe->duration, in.vst->time_base, out.venc->time_base);
-                        } else {
-                            // Fallback to fixed duration calculated from framerate
-                            frame_duration = av_rescale_q(1, av_inv_q(fr), out.venc->time_base);
-                        }
-                        if (frame_duration <= 0) frame_duration = 1;  // Safety clamp
-                        outFrame->duration = frame_duration;
-
-                        if (use_cuda_path)
-                            rtx.syncStream();
-                        encode_and_write(out.venc, out.vstream, out.fmt, out, outFrame, opkt, "send frame to encoder");
-                        av_frame_unref(frame.get());
-                        if (swframe)
-                            av_frame_unref(swframe.get());
-                    }
-                }
+                // Decode this video packet via the shared pump (extracted above).
+                // Returns false only when the duration limit is hit -> stop.
+                if (!pump_video_decoder(pkt.get()))
+                    goto done_processing;
                 // Video packet fully processed, continue to next packet
                 continue;
             }
@@ -1082,7 +1058,21 @@ int run_pipeline(PipelineConfig cfg)
             }
         }
 
+        // EOF: drain the video decoder. Hardware decoders (NVDEC) buffer several
+        // frames internally; without a null-packet flush the trailing frames are
+        // never retrieved (the dropped-tail defect). Send a null packet and run
+        // all delayed frames through the same pump. Reached only on normal EOF —
+        // the duration-limit path gotos straight to done_processing, skipping this.
+        pump_video_decoder(nullptr);
+
     done_processing:
+        // Step 3: flush the RTX-evaluate pipeline so the stuck last frame(s) are
+        // emitted before the encoder flush. Reached both by normal EOF (after the
+        // decoder drain above) and by the duration-limit goto — in either case the
+        // in-flight frames were submitted within the requested range.
+
+
+
         // Flush encoder (uses encode_and_write to ensure DTS monotonicity fix is applied)
         LOG_DEBUG("Finished processing all frames, flushing encoder...");
         encode_and_write(out.venc, out.vstream, out.fmt, out, nullptr, opkt, "flush encoder");

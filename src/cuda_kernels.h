@@ -57,6 +57,24 @@ void launch_p010_to_nv12(const uint8_t *d_yIn, int pitchYIn,
                          int w, int h,
                          cudaStream_t stream);
 
+// Launch NV12 (8-bit) -> P010 (10-bit MSB-aligned) pure-YUV upshift.
+// OOG fix: bypass path must never round-trip through RGB.
+void launch_nv12_to_p010(const uint8_t *d_yIn, int pitchYIn,
+                         const uint8_t *d_uvIn, int pitchUVIn,
+                         uint8_t *d_yOut, int pitchYOut,
+                         uint8_t *d_uvOut, int pitchUVOut,
+                         int w, int h,
+                         cudaStream_t stream);
+
+// OOG fix #2: element-wise out = clamp(nat + vsr - base, 0, 255) on u8
+// planes (widthBytes = BYTES per row; works for Y and interleaved UV).
+void launch_residual_combine(const uint8_t *nat, int pitchN,
+                             const uint8_t *vsr, int pitchV,
+                             const uint8_t *base, int pitchB,
+                             uint8_t *out, int pitchO,
+                             int widthBytes, int h,
+                             cudaStream_t stream);
+
 // Launch P010 (10-bit YUV420) -> X2BGR10LE (10-bit RGB) conversion on device.
 // d_y, d_uv are device pointers to P010 planes with pitches pitchY and pitchUV.
 // outX2BGR10 is device pointer with pitch outPitch (bytes per row), size w x h.
@@ -67,3 +85,12 @@ void launch_p010_to_x2bgr10(const uint8_t *d_y, int pitchY,
                             int w, int h,
                             bool bt2020,
                             cudaStream_t stream);
+
+// BC-spline bicubic upscale NV12 -> NV12 (used by the OOG residual
+// reconstruction: native-YUV and clipped-base upscales). (B,C): Catmull-Rom
+// = (0, 0.5), Mitchell-Netravali = (1/3, 1/3). srcW/H and dstW/H are the luma dims;
+// chroma is handled at half resolution (4:2:0 interleaved UV).
+void launch_bicubic_scale_nv12(const uint8_t *d_yIn, int pitchYIn, const uint8_t *d_uvIn, int pitchUVIn,
+                               int srcW, int srcH,
+                               uint8_t *d_yOut, int pitchYOut, uint8_t *d_uvOut, int pitchUVOut,
+                               int dstW, int dstH, float B, float C, cudaStream_t stream);

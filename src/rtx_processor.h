@@ -21,6 +21,13 @@ struct RTXProcessConfig
     bool inputIsHDR = false; // True for PQ/HLG transfer (HDR10, Dolby Vision, HLG)
     int vsrQuality = 4;  // 1..4 (4=highest)
     int scaleFactor = 2; // 2x
+    // OOG fix #2 (residual reconstruction, SDR NV12 VSR path): the RGB
+    // round-trip that feeds the VSR network clamps out-of-gamut YUV.
+    // When true, the network only contributes DETAIL:
+    //   out = bicubicYUV(original) + (VSR_out - bicubicYUV(clipped_base))
+    // so base colors come from true YUV and the clip cancels in the
+    // subtraction. Disable with --no-vsr-yuv-restore for A/B.
+    bool vsrYuvRestore = true;
     // TrueHDR defaults per sample
     int thdrContrast = 100;
     int thdrSaturation = 100;
@@ -164,6 +171,16 @@ private:
     size_t m_devTempYPitch = 0;
     uint8_t *m_devTempUV = nullptr;  // srcW x (srcH/2), pitched
     size_t m_devTempUVPitch = 0;
+
+    // OOG fix #2: dst-size NV12 buffers for VSR residual reconstruction
+    // (vsr = net output; base = bicubic of clipped roundtrip; nat =
+    // bicubic of true YUV). All dstW x dstH(/2), pitched.
+    uint8_t *m_devVsrY = nullptr;  size_t m_devVsrYPitch = 0;
+    uint8_t *m_devVsrUV = nullptr; size_t m_devVsrUVPitch = 0;
+    uint8_t *m_devBaseY = nullptr;  size_t m_devBaseYPitch = 0;
+    uint8_t *m_devBaseUV = nullptr; size_t m_devBaseUVPitch = 0;
+    uint8_t *m_devNatY = nullptr;  size_t m_devNatYPitch = 0;
+    uint8_t *m_devNatUV = nullptr; size_t m_devNatUVPitch = 0;
 
     // Host staging
     std::vector<uint8_t> m_hostOut; // ABGR10 output when THDR enabled, BGRA8 otherwise

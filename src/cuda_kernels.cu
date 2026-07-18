@@ -409,6 +409,85 @@ __global__ void k_p010_to_nv12(const uint8_t *__restrict__ d_yIn, int pitchYIn,
     }
 }
 
+// OOG fix (2026-07-17): pure YUV upshift NV12 (8-bit) -> P010 (10-bit
+// MSB-aligned). No RGB, no clamp beyond the format's own — bit-exact
+// inverse of k_p010_to_nv12 for 8-bit content.
+__global__ void k_nv12_to_p010(const uint8_t *__restrict__ d_yIn, int pitchYIn,
+                               const uint8_t *__restrict__ d_uvIn, int pitchUVIn,
+                               uint8_t *__restrict__ d_yOut, int pitchYOut,
+                               uint8_t *__restrict__ d_uvOut, int pitchUVOut,
+                               int w, int h)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < w && y < h)
+    {
+        uint16_t *yOut = (uint16_t *)d_yOut;
+        yOut[y * (pitchYOut / 2) + x] =
+            (uint16_t)(d_yIn[y * pitchYIn + x]) << 8;
+    }
+
+    int uvY = y / 2;
+    int uvX = (x / 2) * 2;
+    if (uvX < w && uvY < h / 2 && (x % 2 == 0))
+    {
+        uint16_t *uvOut = (uint16_t *)d_uvOut;
+        uvOut[uvY * (pitchUVOut / 2) + uvX + 0] =
+            (uint16_t)(d_uvIn[uvY * pitchUVIn + uvX + 0]) << 8;
+        uvOut[uvY * (pitchUVOut / 2) + uvX + 1] =
+            (uint16_t)(d_uvIn[uvY * pitchUVIn + uvX + 1]) << 8;
+    }
+}
+
+void launch_nv12_to_p010(const uint8_t *d_yIn, int pitchYIn,
+                         const uint8_t *d_uvIn, int pitchUVIn,
+                         uint8_t *d_yOut, int pitchYOut,
+                         uint8_t *d_uvOut, int pitchUVOut,
+                         int w, int h,
+                         cudaStream_t stream)
+{
+    dim3 block(32, 16);
+    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+    k_nv12_to_p010<<<grid, block, 0, stream>>>(d_yIn, pitchYIn, d_uvIn, pitchUVIn,
+                                               d_yOut, pitchYOut, d_uvOut, pitchUVOut,
+                                               w, h);
+}
+
+// OOG fix #2 (residual reconstruction): out = clamp(nat + vsr - base).
+// Element-wise on u8 planes (works for Y and for interleaved UV alike:
+// widthBytes counts BYTES per row). nat = bicubic of TRUE YUV (colors,
+// OOG intact); vsr - base = the network's added detail measured inside
+// the same clipped roundtrip (the clip cancels in the subtraction).
+__global__ void k_residual_combine(const uint8_t *__restrict__ nat, int pitchN,
+                                   const uint8_t *__restrict__ vsr, int pitchV,
+                                   const uint8_t *__restrict__ base, int pitchB,
+                                   uint8_t *__restrict__ out, int pitchO,
+                                   int widthBytes, int h)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= widthBytes || y >= h)
+        return;
+    int v = (int)nat[y * pitchN + x] + (int)vsr[y * pitchV + x]
+            - (int)base[y * pitchB + x];
+    out[y * pitchO + x] = (uint8_t)clampi(v, 0, 255);
+}
+
+void launch_residual_combine(const uint8_t *nat, int pitchN,
+                             const uint8_t *vsr, int pitchV,
+                             const uint8_t *base, int pitchB,
+                             uint8_t *out, int pitchO,
+                             int widthBytes, int h,
+                             cudaStream_t stream)
+{
+    dim3 block(32, 16);
+    dim3 grid((widthBytes + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+    k_residual_combine<<<grid, block, 0, stream>>>(nat, pitchN, vsr, pitchV,
+                                                   base, pitchB, out, pitchO,
+                                                   widthBytes, h);
+}
+
 void launch_nv12_to_bgra(const uint8_t *d_y, int pitchY,
                          const uint8_t *d_uv, int pitchUV,
                          uint8_t *outBGRA, int outPitch,
@@ -445,4 +524,90 @@ void launch_p010_to_x2bgr10(const uint8_t *d_y, int pitchY,
     dim3 block(32, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
     k_p010_to_x2bgr10<<<grid, block, 0, stream>>>(d_y, pitchY, d_uv, pitchUV, outX2BGR10, outPitch, w, h, bt2020);
+}
+
+// ---- BC-spline (Mitchell-Netravali family) bicubic upscale, NV12 -> NV12 ----------
+// Parameterized by (B,C): Catmull-Rom = (0, 0.5) [sharper], Mitchell = (1/3, 1/3)
+// [rounder, less ringing]. Used by the OOG residual reconstruction (native-YUV
+// and clipped-base upscales on the SDR VSR path).
+__device__ __forceinline__ float bc_weight(float x, float B, float C)
+{
+    x = fabsf(x);
+    float x2 = x * x, x3 = x2 * x;
+    if (x < 1.0f)
+        return ((12.0f - 9.0f * B - 6.0f * C) * x3 + (-18.0f + 12.0f * B + 6.0f * C) * x2 + (6.0f - 2.0f * B)) / 6.0f;
+    else if (x < 2.0f)
+        return ((-B - 6.0f * C) * x3 + (6.0f * B + 30.0f * C) * x2 + (-12.0f * B - 48.0f * C) * x + (8.0f * B + 24.0f * C)) / 6.0f;
+    return 0.0f;
+}
+
+// One 8-bit channel, arbitrary stride between samples (1 for Y, 2 for interleaved UV).
+__device__ __forceinline__ float sample_bc(const uint8_t *plane, int pitch, int stride,
+                                            int w, int h, float fx, float fy, float B, float C)
+{
+    int ix = (int)floorf(fx), iy = (int)floorf(fy);
+    float tx = fx - ix, ty = fy - iy;
+    float wx[4], wy[4];
+    for (int i = 0; i < 4; i++) { wx[i] = bc_weight((i - 1) - tx, B, C); wy[i] = bc_weight((i - 1) - ty, B, C); }
+    float acc = 0.0f;
+    for (int j = 0; j < 4; j++)
+    {
+        int sy = clampi(iy - 1 + j, 0, h - 1);
+        const uint8_t *row = plane + (size_t)sy * pitch;
+        float rowacc = 0.0f;
+        for (int i = 0; i < 4; i++)
+        {
+            int sx = clampi(ix - 1 + i, 0, w - 1);
+            rowacc += wx[i] * (float)row[sx * stride];
+        }
+        acc += wy[j] * rowacc;
+    }
+    return acc;
+}
+
+// Y plane (or any single-channel 8-bit plane).
+__global__ void k_bicubic_plane(const uint8_t *__restrict__ src, int srcPitch, int srcW, int srcH,
+                                uint8_t *__restrict__ dst, int dstPitch, int dstW, int dstH,
+                                float sx, float sy, float B, float C)
+{
+    int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ox >= dstW || oy >= dstH) return;
+    float fx = (ox + 0.5f) * sx - 0.5f;
+    float fy = (oy + 0.5f) * sy - 0.5f;
+    float v = sample_bc(src, srcPitch, 1, srcW, srcH, fx, fy, B, C);
+    dst[(size_t)oy * dstPitch + ox] = (uint8_t)clampi((int)(v + 0.5f), 0, 255);
+}
+
+// Interleaved NV12 UV plane (2 bytes/pixel: U then V), scaled at chroma resolution.
+__global__ void k_bicubic_uv(const uint8_t *__restrict__ src, int srcPitch, int srcCW, int srcCH,
+                             uint8_t *__restrict__ dst, int dstPitch, int dstCW, int dstCH,
+                             float sx, float sy, float B, float C)
+{
+    int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    int oy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ox >= dstCW || oy >= dstCH) return;
+    float fx = (ox + 0.5f) * sx - 0.5f;
+    float fy = (oy + 0.5f) * sy - 0.5f;
+    float u = sample_bc(src + 0, srcPitch, 2, srcCW, srcCH, fx, fy, B, C);
+    float v = sample_bc(src + 1, srcPitch, 2, srcCW, srcCH, fx, fy, B, C);
+    uint8_t *o = dst + (size_t)oy * dstPitch + ox * 2;
+    o[0] = (uint8_t)clampi((int)(u + 0.5f), 0, 255);
+    o[1] = (uint8_t)clampi((int)(v + 0.5f), 0, 255);
+}
+
+void launch_bicubic_scale_nv12(const uint8_t *d_yIn, int pitchYIn, const uint8_t *d_uvIn, int pitchUVIn,
+                               int srcW, int srcH,
+                               uint8_t *d_yOut, int pitchYOut, uint8_t *d_uvOut, int pitchUVOut,
+                               int dstW, int dstH, float B, float C, cudaStream_t stream)
+{
+    float sxY = (float)srcW / (float)dstW, syY = (float)srcH / (float)dstH;
+    dim3 block(16, 16);
+    dim3 gy((dstW + block.x - 1) / block.x, (dstH + block.y - 1) / block.y);
+    k_bicubic_plane<<<gy, block, 0, stream>>>(d_yIn, pitchYIn, srcW, srcH, d_yOut, pitchYOut, dstW, dstH, sxY, syY, B, C);
+    // Chroma is half-res in each dimension for NV12 4:2:0 (interleaved UV pairs).
+    int srcCW = srcW / 2, srcCH = srcH / 2, dstCW = dstW / 2, dstCH = dstH / 2;
+    float sxC = (float)srcCW / (float)dstCW, syC = (float)srcCH / (float)dstCH;
+    dim3 gc((dstCW + block.x - 1) / block.x, (dstCH + block.y - 1) / block.y);
+    k_bicubic_uv<<<gc, block, 0, stream>>>(d_uvIn, pitchUVIn, srcCW, srcCH, d_uvOut, pitchUVOut, dstCW, dstCH, sxC, syC, B, C);
 }

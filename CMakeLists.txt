@@ -9,8 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Target recent NVIDIA architectures (adjust if needed). 89 = Ada (RTX 40 series)
-set(CMAKE_CUDA_ARCHITECTURES 89)
+# Target NVIDIA RTX architectures: 75=Turing(20), 86=Ampere(30), 89=Ada(40),
+# 120=Blackwell(50, e.g. RTX 5080 — needs CUDA Toolkit >= 12.8).
+set(CMAKE_CUDA_ARCHITECTURES 75 86 89 120)
 
 # Use static MSVC runtime (/MT for Release, /MTd for Debug)
 # Requires CMake >= 3.15; this project requires 3.24 at top, so it's safe.
@@ -135,8 +136,10 @@ set(NV_CODEC_SDK_INCLUDE "${NV_CODEC_SDK_ROOT}/include")
 if(EXISTS "${NV_CODEC_SDK_ROOT}/Interface")
   list(APPEND NV_CODEC_SDK_INCLUDE "${NV_CODEC_SDK_ROOT}/Interface")
 endif()
-# Lib directory (Windows x64)
-if(EXISTS "${NV_CODEC_SDK_ROOT}/Lib/x64")
+# Lib directory (Windows x64). Codec SDK 13.x uses Lib/win/x64; older = Lib/x64.
+if(EXISTS "${NV_CODEC_SDK_ROOT}/Lib/win/x64")
+  set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/Lib/win/x64")
+elseif(EXISTS "${NV_CODEC_SDK_ROOT}/Lib/x64")
   set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/Lib/x64")
 elseif(EXISTS "${NV_CODEC_SDK_ROOT}/lib/x64")
   set(NV_CODEC_SDK_LIB_DIR "${NV_CODEC_SDK_ROOT}/lib/x64")
