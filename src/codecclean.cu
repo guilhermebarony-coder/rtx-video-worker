@@ -298,6 +298,341 @@ __global__ void k_conv3(const float *__restrict__ src, int cin,
     dst[(size_t)o * w * h + y * w + x] = a;
 }
 
+// ------------------------------------------------- convolucao rapida
+//
+// Pesos da camada CORRENTE. Memoria de constante: 64 KB no total, e o
+// acesso uniforme (todo thread do warp le o mesmo endereco) e servido
+// pelo banco de constantes direto como operando da instrucao.
+//
+// CUIDADO: isto e do MODULO, nao da instancia. Duas CodecCleanFilter
+// concorrentes se sobrescreveriam. O init recusa a segunda.
+__constant__ float c_cw[9216];   // ate 32x32x9
+__constant__ float c_cb[64];
+
+// Tile de 32x8 pixels de saida com halo de 1 -> 34x10 na shared.
+#define CC_TW 34
+#define CC_TH 10
+
+// COUT em template para os acumuladores ficarem em REGISTRADOR: com
+// indice de tempo de execucao o array vai para memoria local e o kernel
+// fica mais lento que o ingenuo.
+// ------------------------------------------- convolucao rapida, v2
+//
+// CG canais de entrada por carga: as leituras vao juntas para a memoria
+// (uma cobre a latencia da outra) e o numero de barreiras cai por CG.
+#define CC_CG 4
+
+// CIN_T = 0 -> cin de tempo de execucao. Diferente de zero, o indice do
+// peso vira deslocamento imediato e some a multiplicacao inteira.
+template <int COUT, int CIN_T, int CONSTW>
+__global__ void k_conv3_tile2(const float *__restrict__ src, int cinRT,
+                              float *__restrict__ dst,
+                              const float *__restrict__ wt,
+                              const float *__restrict__ bias,
+                              int w, int h, int relu, int resid)
+{
+    __shared__ float sm[CC_CG][CC_TH][CC_TW];
+
+    const int cin = CIN_T ? CIN_T : cinRT;
+    const int bx = blockIdx.x * 32, by = blockIdx.y * 8;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int x = bx + tx, y = by + ty;
+    const int tid = ty * 32 + tx;
+    const size_t N = (size_t)w * h;
+
+    float acc[COUT];
+#pragma unroll
+    for (int o = 0; o < COUT; ++o)
+        acc[o] = CONSTW ? c_cb[o] : bias[o];
+
+    for (int c0 = 0; c0 < cin; c0 += CC_CG)
+    {
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < CC_CG; ++g)
+        {
+            if (c0 + g >= cin)
+                break;
+            const float *plane = src + (size_t)(c0 + g) * N;
+            for (int t = tid; t < CC_TW * CC_TH; t += 256)
+            {
+                int sy = t / CC_TW, sx = t - sy * CC_TW;
+                int gy = by + sy - 1, gx = bx + sx - 1;
+                // padding ZERO, o do nn.Conv2d(padding=1)
+                sm[g][sy][sx] = (gx >= 0 && gx < w && gy >= 0 && gy < h)
+                                    ? plane[(size_t)gy * w + gx]
+                                    : 0.0f;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int g = 0; g < CC_CG; ++g)
+        {
+            if (c0 + g >= cin)
+                break;
+            float v[9];
+#pragma unroll
+            for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
+                for (int kx = 0; kx < 3; ++kx)
+                    v[ky * 3 + kx] = sm[g][ty + ky][tx + kx];
+
+            const int base = (c0 + g) * 9;
+#pragma unroll
+            for (int o = 0; o < COUT; ++o)
+            {
+                const int wo = o * cin * 9 + base;
+#pragma unroll
+                for (int t = 0; t < 9; ++t)
+                    acc[o] = fmaf(CONSTW ? c_cw[wo + t] : wt[wo + t],
+                                  v[t], acc[o]);
+            }
+        }
+    }
+
+    if (x >= w || y >= h)
+        return;
+    // `resid` = a saida SOMA no que ja esta em dst (a ponte do ResBlock).
+    // A soma vem DEPOIS da acumulacao inteira, igual ao k_add que ela
+    // substitui — mesma ordem, mesmo numero.
+    if (resid)
+    {
+#pragma unroll
+        for (int o = 0; o < COUT; ++o)
+        {
+            size_t idx = (size_t)o * N + (size_t)y * w + x;
+            float a = acc[o];
+            if (relu && a < 0.0f)
+                a = 0.0f;
+            dst[idx] += a;
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int o = 0; o < COUT; ++o)
+        {
+            float a = acc[o];
+            if (relu && a < 0.0f)
+                a = 0.0f;
+            dst[(size_t)o * N + (size_t)y * w + x] = a;
+        }
+    }
+}
+
+// ---------------------------------------- conv com peso em PARAMETRO
+//
+// Parametro de kernel mora no banco de constantes 0 e e escrito pela
+// via normal do lancamento. Da o mesmo operando imediato da FFMA que a
+// memoria de constante dava, SEM `cudaMemcpyToSymbol` — que dentro do
+// worker custava mais caro que o kernel ingenuo inteiro (medido:
+// 41,92 contra 37,45 ms/quadro, com o ingenuo perdendo so para si
+// mesmo no bench).
+//
+// Teto de 32.764 bytes por lancamento: por isso 16 canais de saida por
+// vez (16x32x9x4 + 64 = 18.496 B). Dois lancamentos por camada.
+template <int COUT, int CIN_T>
+struct PesosKP
+{
+    float w[COUT * CIN_T * 9];
+    float b[COUT];
+};
+
+template <int COUT, int CIN_T>
+__global__ void k_conv3_kp(__grid_constant__ const PesosKP<COUT, CIN_T> pk,
+                           const float *__restrict__ src,
+                           float *__restrict__ dst, int oBase,
+                           int w, int h, int relu, int resid)
+{
+    __shared__ float sm[CC_CG][CC_TH][CC_TW];
+
+    const int cin = CIN_T;
+    const int bx = blockIdx.x * 32, by = blockIdx.y * 8;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int x = bx + tx, y = by + ty;
+    const int tid = ty * 32 + tx;
+    const size_t N = (size_t)w * h;
+
+    float acc[COUT];
+#pragma unroll
+    for (int o = 0; o < COUT; ++o)
+        acc[o] = pk.b[o];
+
+    for (int c0 = 0; c0 < cin; c0 += CC_CG)
+    {
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < CC_CG; ++g)
+        {
+            if (c0 + g >= cin)
+                break;
+            const float *plane = src + (size_t)(c0 + g) * N;
+            for (int t = tid; t < CC_TW * CC_TH; t += 256)
+            {
+                int sy = t / CC_TW, sx = t - sy * CC_TW;
+                int gy = by + sy - 1, gx = bx + sx - 1;
+                sm[g][sy][sx] = (gx >= 0 && gx < w && gy >= 0 && gy < h)
+                                    ? plane[(size_t)gy * w + gx]
+                                    : 0.0f;      // padding ZERO
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int g = 0; g < CC_CG; ++g)
+        {
+            if (c0 + g >= cin)
+                break;
+            float v[9];
+#pragma unroll
+            for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
+                for (int kx = 0; kx < 3; ++kx)
+                    v[ky * 3 + kx] = sm[g][ty + ky][tx + kx];
+
+            const int base = (c0 + g) * 9;
+#pragma unroll
+            for (int o = 0; o < COUT; ++o)
+            {
+                const int wo = o * CIN_T * 9 + base;
+#pragma unroll
+                for (int t = 0; t < 9; ++t)
+                    acc[o] = fmaf(pk.w[wo + t], v[t], acc[o]);
+            }
+        }
+    }
+
+    if (x >= w || y >= h)
+        return;
+    // MESMA ordem de soma do caminho ingenuo: o residuo entra depois da
+    // acumulacao inteira. O gate cobra igualdade BIT A BIT.
+    if (resid)
+    {
+#pragma unroll
+        for (int o = 0; o < COUT; ++o)
+        {
+            float a = acc[o];
+            if (relu && a < 0.0f)
+                a = 0.0f;
+            dst[(size_t)(oBase + o) * N + (size_t)y * w + x] += a;
+        }
+    }
+    else
+    {
+#pragma unroll
+        for (int o = 0; o < COUT; ++o)
+        {
+            float a = acc[o];
+            if (relu && a < 0.0f)
+                a = 0.0f;
+            dst[(size_t)(oBase + o) * N + (size_t)y * w + x] = a;
+        }
+    }
+}
+
+// Monta o grupo de COUT canais e lanca. `hw`/`hb` sao os pesos DESTA
+// camada no HOST: o parametro do kernel e copiado pelo driver a cada
+// lancamento, entao eles precisam estar do lado de ca.
+template <int COUT, int CIN_T>
+static void lanca_kp(const float *hw, const float *hb, int oBase,
+                     const float *src, float *dst, int w, int h,
+                     int relu, int resid, cudaStream_t st)
+{
+    PesosKP<COUT, CIN_T> pk;
+    memcpy(pk.w, hw + (size_t)oBase * CIN_T * 9,
+           sizeof(float) * COUT * CIN_T * 9);
+    memcpy(pk.b, hb + oBase, sizeof(float) * COUT);
+    dim3 blk(32, 8), grd((w + 31) / 32, (h + 7) / 8);
+    k_conv3_kp<COUT, CIN_T><<<grd, blk, 0, st>>>(pk, src, dst, oBase,
+                                                 w, h, relu, resid);
+}
+
+// Launcher: escolhe o caminho e some com o template do lado de fora.
+// modo 0 = ingenuo (referencia), 1 = constante, 2 = global.
+// Devolve false se caiu no ingenuo por falta de especializacao.
+bool conv3_launch(const float *src, int cin, float *dst, int cout,
+                  const float *wt, const float *bias, int w, int h,
+                  int relu, int resid, cudaStream_t st, int modo,
+                  const float *hostW, const float *hostB)
+{
+    dim3 blk(32, 8), grd((w + 31) / 32, (h + 7) / 8);
+    const size_t nw = (size_t)cout * cin * 9;
+
+    // MODO 3: peso como parametro do kernel. So as formas do campeao —
+    // o teto de 32.764 bytes por lancamento nao deixa generalizar, e
+    // quem nao cabe cai no modo 2, que e correto e so mais lento.
+    if (modo == 3)
+    {
+        if (hostW && hostB && cout == 32 && cin == 32)
+        {
+            lanca_kp<16, 32>(hostW, hostB, 0, src, dst, w, h, relu, resid, st);
+            lanca_kp<16, 32>(hostW, hostB, 16, src, dst, w, h, relu, resid, st);
+            return true;
+        }
+        if (hostW && hostB && cout == 32 && cin == 11)
+        {
+            lanca_kp<16, 11>(hostW, hostB, 0, src, dst, w, h, relu, resid, st);
+            lanca_kp<16, 11>(hostW, hostB, 16, src, dst, w, h, relu, resid, st);
+            return true;
+        }
+        if (hostW && hostB && cout == 1 && cin == 32)
+        {
+            lanca_kp<1, 32>(hostW, hostB, 0, src, dst, w, h, relu, resid, st);
+            return true;
+        }
+        modo = 2;    // forma nao coberta (ou sem peso no host): global
+    }
+
+    // A constante tem 64 KB. Cabe 32x32x9 (36 KB); NAO cabe 48x48x9
+    // (81 KB), que e o modelo de controle da fornada. Quando nao cabe,
+    // o peso vem da global — mais lento, mas roda.
+    // modo 2 = mesmo tile, peso na global: para quem NAO e dono da
+    // memoria de constante, e para pesos que nao cabem nela.
+    const int constw = (modo == 1) && (nw <= 9216 && cout <= 64);
+    if (constw)
+    {
+        cudaMemcpyToSymbolAsync(c_cw, wt, nw * sizeof(float), 0,
+                                cudaMemcpyDeviceToDevice, st);
+        cudaMemcpyToSymbolAsync(c_cb, bias, (size_t)cout * sizeof(float), 0,
+                                cudaMemcpyDeviceToDevice, st);
+    }
+
+#define CC_D2(CO, CI)                                                          \
+    do {                                                                       \
+        if (constw) k_conv3_tile2<CO, CI, 1><<<grd, blk, 0, st>>>(              \
+                        src, cin, dst, wt, bias, w, h, relu, resid);           \
+        else        k_conv3_tile2<CO, CI, 0><<<grd, blk, 0, st>>>(              \
+                        src, cin, dst, wt, bias, w, h, relu, resid);           \
+        return true;                                                           \
+    } while (0)
+
+    if (modo != 0)
+    {
+        // formas do campeao com cin fixo em template: o indice do peso
+        // vira deslocamento imediato e some a multiplicacao inteira
+        if (cout == 32 && cin == 32) CC_D2(32, 32);
+        if (cout == 32 && cin == 11) CC_D2(32, 11);
+        if (cout == 1  && cin == 32) CC_D2(1, 32);
+        switch (cout)
+        {
+        case 1:  CC_D2(1, 0);
+        case 16: CC_D2(16, 0);
+        case 24: CC_D2(24, 0);
+        case 32: CC_D2(32, 0);
+        case 48: CC_D2(48, 0);
+        default: break;    // largura nao especializada -> ingenuo
+        }
+    }
+#undef CC_D2
+
+    // Caminho ingenuo: a REFERENCIA. Nao sabe somar residuo, e nao
+    // precisa — quem chama com resid=1 esta no caminho rapido.
+    dim3 gz((w + 31) / 32, (h + 7) / 8, cout);
+    k_conv3<<<gz, blk, 0, st>>>(src, cin, dst, cout, wt, bias, w, h, relu);
+    return modo == 0;
+}
+
 // x = x + r  (a soma do ResBlock)
 __global__ void k_add(float *__restrict__ x, const float *__restrict__ r, int n)
 {
@@ -369,10 +704,44 @@ __global__ void k_dither(float *__restrict__ out, int w, int h, unsigned frameId
 
 #define CCK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return false; } while (0)
 
+// Quem manda na memoria de constante. Ver a nota no topo de c_cw: ela
+// e do modulo, entao so uma instancia pode escrever nela.
+static CodecCleanFilter *s_donoDaConstante = nullptr;
+
 bool CodecCleanFilter::init(const char *blobPath, int w, int h, cudaStream_t stream)
 {
     m_w = w; m_h = h; m_stream = stream;
     m_pushed = m_popped = 0; m_ended = false;
+
+    // A primeira instancia fica dona da constante; as demais caem no
+    // caminho global. Sem isto, duas instancias em streams diferentes
+    // se sobrescreveriam e o defeito sairia em pixel, nao em erro.
+    // Modo 3 (peso por parametro) e o de producao: da o operando
+    // imediato da FFMA sem escrever em memoria de constante. O dono da
+    // constante so importa se alguem FORCAR o modo 1 pelo CC_MODO.
+    m_modoConv = 3;
+    if (s_donoDaConstante == nullptr)
+        s_donoDaConstante = this;
+
+    // Escotilha de diagnostico: CC_MODO=0/1/2 forca o caminho da
+    // convolucao. Existe porque medida sintetica e medida no relogio
+    // discordaram por 5x e so o A/B dentro do worker desempata.
+    if (const char *e = getenv("CC_MODO"))
+    {
+        int m = atoi(e);
+        if (m == 1 && s_donoDaConstante != this)
+        {
+            fprintf(stderr, "[codecclean] CC_MODO=1 pedido mas a constante "
+                            "ja tem dono; usando 2\n");
+            m = 2;
+        }
+        if (m >= 0 && m <= 3)
+        {
+            m_modoConv = m;
+            fprintf(stderr, "[codecclean] CC_MODO=%d forcado%s\n", m,
+                    m == 0 ? " (kernel ingenuo, LENTO de proposito)" : "");
+        }
+    }
 
     FILE *f = fopen(blobPath, "rb");
     if (!f)
@@ -402,13 +771,16 @@ bool CodecCleanFilter::init(const char *blobPath, int w, int h, cudaStream_t str
     ok &= cudaMalloc(&m_in, (size_t)m_cin * N * 4) == cudaSuccess;
     ok &= cudaMalloc(&m_a, (size_t)m_ch * N * 4) == cudaSuccess;
     ok &= cudaMalloc(&m_b, (size_t)m_ch * N * 4) == cudaSuccess;
-    ok &= cudaMalloc(&m_c, (size_t)m_ch * N * 4) == cudaSuccess;
     for (float **p : {&m_f, &m_f2, &m_t1, &m_t2, &m_acc, &m_soma, &m_res, &m_noise})
         ok &= cudaMalloc(p, N * 4) == cudaSuccess;
     if (!ok) { free(hostW); destroy(); return false; }
 
     cudaMemcpy(m_w8, hostW, nW * 4, cudaMemcpyHostToDevice);
-    free(hostW);
+    // O peso FICA no host tambem: o modo 3 passa por parametro de
+    // kernel, e o driver copia do lado de ca a cada lancamento. Sao
+    // 310 KB para o campeao — barato perto de drenar o dispositivo 10
+    // vezes por quadro, que era o custo da memoria de constante.
+    m_hostW = hostW;
 
     // offsets na MESMA ordem do dump_blob — contrato, nao convencao
     size_t o = 0;
@@ -427,14 +799,17 @@ bool CodecCleanFilter::init(const char *blobPath, int w, int h, cudaStream_t str
 
 void CodecCleanFilter::destroy()
 {
+    if (s_donoDaConstante == this)
+        s_donoDaConstante = nullptr;
+    if (m_hostW) { free(m_hostW); m_hostW = nullptr; }
     for (void *p : {(void *)m_w8, (void *)m_ring, (void *)m_ringUV,
                     (void *)m_in, (void *)m_a,
-                    (void *)m_b, (void *)m_c, (void *)m_f, (void *)m_f2,
+                    (void *)m_b, (void *)m_f, (void *)m_f2,
                     (void *)m_t1, (void *)m_t2, (void *)m_acc, (void *)m_soma,
                     (void *)m_res, (void *)m_noise})
         if (p) cudaFree(p);
     m_w8 = nullptr; m_ring = nullptr; m_ringUV = nullptr;
-    m_in = m_a = m_b = m_c = nullptr;
+    m_in = m_a = m_b = nullptr;
     m_f = m_f2 = m_t1 = m_t2 = m_acc = m_soma = m_res = m_noise = nullptr;
 }
 
@@ -564,16 +939,29 @@ void CodecCleanFilter::runNetwork(int centro, float strength,
     }
 
     // --- a rede --------------------------------------------------------
-    dim3 gCh((W + 31) / 32, (H + 7) / 8, m_ch);
-    dim3 g1((W + 31) / 32, (H + 7) / 8, 1);
-    k_conv3<<<gCh, blk, 0, st>>>(m_in, m_cin, m_a, m_ch, m_wInp, m_bInp, W, H, 1);
+    // MODO 3: peso como parametro do kernel. Nao e o mais rapido no
+    // bench por muito — mas e o unico que nao escreve em memoria de
+    // constante, e essa escrita custa 28 ms/quadro DENTRO do worker
+    // (41,92 do modo 1 contra 13,72 deste). conv3_launch cai sozinho
+    // para o modo 2 nas formas que nao cabem em 32 KB de parametro.
+    const int modo = m_modoConv;
+    // O host guarda o MESMO leiaute do device: o deslocamento de cada
+    // camada e a diferenca dos ponteiros de device. Sem membro novo.
+    const float *HW = m_hostW;
+    auto hp = [&](const float *dev) { return HW ? HW + (dev - m_w8) : nullptr; };
+    conv3_launch(m_in, m_cin, m_a, m_ch, m_wInp, m_bInp, W, H, 1, 0, st, modo,
+                 hp(m_wInp), hp(m_bInp));
     for (int b = 0; b < m_bl; ++b)
     {
-        k_conv3<<<gCh, blk, 0, st>>>(m_a, m_ch, m_b, m_ch, m_w1[b], m_b1[b], W, H, 1);
-        k_conv3<<<gCh, blk, 0, st>>>(m_b, m_ch, m_c, m_ch, m_w2[b], m_b2[b], W, H, 0);
-        k_add<<<(int)((m_ch * N + 255) / 256), 256, 0, st>>>(m_a, m_c, (int)(m_ch * N));
+        conv3_launch(m_a, m_ch, m_b, m_ch, m_w1[b], m_b1[b], W, H, 1, 0, st,
+                     modo, hp(m_w1[b]), hp(m_b1[b]));
+        // resid=1: a segunda conv soma direto em m_a. Sem isto haveria
+        // um k_add movendo 354 MB por bloco, 1,4 GB por quadro.
+        conv3_launch(m_b, m_ch, m_a, m_ch, m_w2[b], m_b2[b], W, H, 0, 1, st,
+                     modo, hp(m_w2[b]), hp(m_b2[b]));
     }
-    k_conv3<<<g1, blk, 0, st>>>(m_a, m_ch, m_res, 1, m_wOut, m_bOut, W, H, 0);
+    conv3_launch(m_a, m_ch, m_res, 1, m_wOut, m_bOut, W, H, 0, 0, st, modo,
+                 hp(m_wOut), hp(m_bOut));
 
     // --- composicao: deg + k*residuo, com dither e soma em double ------
     k_dither<<<grd, blk, 0, st>>>(m_noise, W, H, (unsigned)centro);

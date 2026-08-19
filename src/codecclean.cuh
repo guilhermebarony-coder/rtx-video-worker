@@ -27,6 +27,27 @@ __global__ void k_scale(float *x, float s, int n);
 __global__ void k_fill(float *x, float v, int n);
 __global__ void k_conv3(const float *src, int cin, float *dst, int cout,
                         const float *wt, const float *bias, int w, int h, int relu);
+// Convolucao 3x3 escolhendo o caminho. O template dos acumuladores
+// fica DENTRO do .cu; aqui so entra a funcao de host, para o bench e o
+// gate poderem chamar sem instanciar template.
+//   modo 0 = ingenuo, a REFERENCIA (lento de proposito, simples de ler)
+//   modo 1 = tile + peso em memoria de constante. RAPIDO SOZINHO,
+//            LENTO NO WORKER: cada escrita na constante drena o
+//            dispositivo, e com o VSR em outro stream isso custa mais
+//            que o kernel ingenuo inteiro. Fica so para comparacao.
+//   modo 2 = tile + peso na global (sem escrita em constante)
+//   modo 3 = tile + peso como PARAMETRO do kernel: o operando imediato
+//            do modo 1 sem a drenagem. E O DE PRODUCAO. Precisa de
+//            hostW/hostB e so cobre as formas do campeao; o resto cai
+//            sozinho no modo 2.
+// `resid` = soma em cima do que ja esta em dst, em vez de sobrescrever
+// (a ponte do ResBlock). So o modo 1 sabe fazer isso.
+// Devolve false se caiu no ingenuo por falta de especializacao de cout.
+bool conv3_launch(const float *src, int cin, float *dst, int cout,
+                  const float *wt, const float *bias, int w, int h,
+                  int relu, int resid, cudaStream_t st, int modo,
+                  const float *hostW = nullptr, const float *hostB = nullptr);
+
 __global__ void k_add(float *x, const float *r, int n);
 __global__ void k_compose(const uint8_t *deg, int pitchIn, const float *res,
                           const float *ruido, uint8_t *out, int pitchOut,
@@ -82,6 +103,12 @@ private:
     void runNetwork(int centro, float strength, uint8_t *d_out, int outPitch);
 
     int m_w = 0, m_h = 0, m_ch = 0, m_bl = 0, m_cin = 0;
+    // 1 = peso na memoria de constante (so a primeira instancia),
+    // 2 = peso na global. Ver s_donoDaConstante no .cu.
+    int m_modoConv = 3;
+    // Copia dos pesos no HOST: o modo 3 passa peso por parametro de
+    // kernel, e o driver copia do lado de ca a cada lancamento.
+    float *m_hostW = nullptr;
     long long m_pushed = 0;   // quantos quadros entraram
     long long m_popped = 0;   // quantos sairam
     bool m_ended = false;
@@ -90,7 +117,7 @@ private:
     uint8_t *m_ring = nullptr;      // 7 planos Y contiguos, pitch = m_w
     uint8_t *m_ringUV = nullptr;    // 7 planos UV, pitch = m_w, altura h/2
     float *m_w8 = nullptr;          // pesos
-    float *m_in = nullptr, *m_a = nullptr, *m_b = nullptr, *m_c = nullptr;
+    float *m_in = nullptr, *m_a = nullptr, *m_b = nullptr;
     float *m_f = nullptr, *m_f2 = nullptr, *m_t1 = nullptr, *m_t2 = nullptr;
     float *m_acc = nullptr, *m_soma = nullptr, *m_res = nullptr, *m_noise = nullptr;
     float *m_wInp = nullptr, *m_bInp = nullptr, *m_wOut = nullptr, *m_bOut = nullptr;

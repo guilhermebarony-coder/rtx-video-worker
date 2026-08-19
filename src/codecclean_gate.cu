@@ -37,6 +37,12 @@ int main(int argc, char **argv)
 {
     const char *blobPath = argc > 1 ? argv[1] : "cc_32x4.blob";
     const char *casoPath = argc > 2 ? argv[2] : "caso_32x4.bin";
+    // 0 = kernel ingenuo, 1 = o rapido (o que a producao roda)
+    const int MODO = argc > 3 ? atoi(argv[3]) : 3;
+    printf("modo do kernel: %d%s\n", MODO,
+           MODO == 0 ? "  (ingenuo)"
+                     : (MODO == 3 ? "  (peso por parametro, como a producao)"
+                                  : "  (variante de comparacao)"));
 
     // ---- blob de pesos -------------------------------------------------
     FILE *fb = fopen(blobPath, "rb");
@@ -162,19 +168,31 @@ int main(int argc, char **argv)
         }
 
         // --- a rede ------------------------------------------------------
-        dim3 g3((W + 31) / 32, (H + 7) / 8, CH);
-        cc::k_conv3<<<g3, blk>>>(dIn, CIN, dA, CH, w_inp, b_inp, W, H, 1);
+        // Pelo LAUNCHER, com o mesmo modo da producao: um gate que chama
+        // o kernel ingenuo abencoa codigo que nao esta mais no caminho.
+        // hW tem o MESMO leiaute de dW: o deslocamento de cada camada e a
+        // diferenca dos ponteiros de device. O modo 3 precisa deles.
+        auto hp = [&](const float *dev) { return hW + (dev - dW); };
+        cc::conv3_launch(dIn, CIN, dA, CH, w_inp, b_inp, W, H, 1, 0, 0, MODO,
+                         hp(w_inp), hp(b_inp));
         for (int b = 0; b < BL; ++b) {
             // c1 -> relu -> c2, e o resultado SOMA em dA (o residuo do bloco).
-            // dB e dC sao buffers distintos: conv3 le e escreve plano a
+            // dB e dA sao buffers distintos: a conv le e escreve plano a
             // plano, entao src == dst daria corrida entre threads de
             // blocos diferentes — leitura de valor ja sobrescrito.
-            cc::k_conv3<<<g3, blk>>>(dA, CH, dB, CH, w1[b], b1[b], W, H, 1);
-            cc::k_conv3<<<g3, blk>>>(dB, CH, dC, CH, w2[b], b2[b], W, H, 0);
-            cc::k_add<<<(CH * N + 255) / 256, 256>>>(dA, dC, CH * N);
+            cc::conv3_launch(dA, CH, dB, CH, w1[b], b1[b], W, H, 1, 0, 0, MODO,
+                             hp(w1[b]), hp(b1[b]));
+            if (MODO != 0) {
+                // resid=1: a soma do bloco vai dentro da propria conv
+                cc::conv3_launch(dB, CH, dA, CH, w2[b], b2[b], W, H, 0, 1, 0,
+                                 MODO, hp(w2[b]), hp(b2[b]));
+            } else {
+                cc::conv3_launch(dB, CH, dC, CH, w2[b], b2[b], W, H, 0, 0, 0, 0);
+                cc::k_add<<<(CH * N + 255) / 256, 256>>>(dA, dC, CH * N);
+            }
         }
-        dim3 g1((W + 31) / 32, (H + 7) / 8, 1);
-        cc::k_conv3<<<g1, blk>>>(dA, CH, dRes, 1, w_out, b_out, W, H, 0);
+        cc::conv3_launch(dA, CH, dRes, 1, w_out, b_out, W, H, 0, 0, 0, MODO,
+                         hp(w_out), hp(b_out));
         CK(cudaDeviceSynchronize());
 
         // --- comparacao --------------------------------------------------

@@ -536,7 +536,13 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
         cpY.dstPitch = (unsigned int)pitchOutY;
         cpY.WidthInBytes = (unsigned int)m_srcW;
         cpY.Height = m_srcH;
-        CUDADRV_CHECK(cuMemcpy2D(&cpY));
+        // NO STREAM DO PROCESSADOR, nao no nulo: quem escreve `d_y` pode
+        // ser o CodecClean, que roda em m_stream (non-blocking, que NAO
+        // sincroniza com o stream nulo). Com `cuMemcpy2D` sincrono aqui,
+        // cada copia levava o resultado do quadro ANTERIOR — a saida
+        // saia com um quadro branco na frente e tudo deslocado em 1,
+        // com a contagem certa. Medido, nao suposto.
+        CUDADRV_CHECK(cuMemcpy2DAsync(&cpY, m_stream));
         CUDA_MEMCPY2D cpUV{};
         cpUV.srcMemoryType = CU_MEMORYTYPE_DEVICE;
         cpUV.srcDevice = (CUdeviceptr)d_uv;
@@ -546,7 +552,10 @@ bool RTXProcessor::processGpuNV12ToNV12(const uint8_t *d_y, int pitchY,
         cpUV.dstPitch = (unsigned int)pitchOutUV;
         cpUV.WidthInBytes = (unsigned int)m_srcW;      // NV12: UV interleaved, W bytes
         cpUV.Height = m_srcH / 2;
-        CUDADRV_CHECK(cuMemcpy2D(&cpUV));
+        CUDADRV_CHECK(cuMemcpy2DAsync(&cpUV, m_stream));
+        // Sincroniza como faz o bypass de P010: o contrato de process()
+        // e que o quadro esta pronto quando ele retorna.
+        cudaStreamSynchronize(m_stream);
         return true;
     }
 
