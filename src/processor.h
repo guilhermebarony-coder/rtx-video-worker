@@ -87,8 +87,17 @@ public:
         {
             return false;
         }
-        if (!m_rtx.processGpuNV12ToNV12(m_ccOut, m_ccW, m_lastUV, m_lastUVPitch,
-                                        enc_hw, m_bt2020))
+        // O drain sai pelo MESMO caminho que o quadro normal sairia:
+        // com THDR o destino e P010, sem ele e NV12. Um drain que
+        // ignorasse isso entregaria os 3 ultimos quadros por outro
+        // caminho que o resto do video.
+        const bool okDrain =
+            m_thdrEnabled
+                ? m_rtx.processGpuNV12ToP010(m_ccOut, m_ccW, m_lastUV,
+                                             m_lastUVPitch, enc_hw, m_bt2020)
+                : m_rtx.processGpuNV12ToNV12(m_ccOut, m_ccW, m_lastUV,
+                                             m_lastUVPitch, enc_hw, m_bt2020);
+        if (!okDrain)
         {
             return false;
         }
@@ -107,6 +116,19 @@ public:
         {
             AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext *)decframe->hw_frames_ctx->data;
             sw_format = hw_frames_ctx->sw_format;
+        }
+
+        // O filtro e 8 BITS por construcao (ring uint8, compose em
+        // 0..255). Entrada de 10 bits nao tem como passar por ele —
+        // entao ERRO, nao silencio. Seguir sem o filtro entregaria um
+        // video silenciosamente diferente do que foi pedido, que e a
+        // mesma lei ja aplicada ao blob que nao carrega.
+        if (m_ccOn && sw_format == AV_PIX_FMT_P010LE)
+        {
+            fprintf(stderr, "[codecclean] ERRO: entrada de 10 bits (P010) e o "
+                            "filtro opera em 8 bits. Rode sem --cc-blob ou "
+                            "converta a entrada para 8 bits.\n");
+            return false;
         }
 
         AVFrame *enc_hw = m_pool.acquire();
@@ -156,8 +178,30 @@ public:
             // NV12 input: SDR content
             if (m_thdrEnabled)
             {
-                ok = m_rtx.processGpuNV12ToP010(decframe->data[0], decframe->linesize[0],
-                                                decframe->data[1], decframe->linesize[1],
+                // O THDR muda a SAIDA (10 bits), nao a entrada: aqui ela
+                // continua NV12 de 8 bits, entao o filtro roda igual ao
+                // ramo SDR. Ate 19/08 este ramo IGNORAVA o filtro em
+                // silencio — e como o THDR e o PADRAO do worker, era o
+                // caminho mais provavel de o usuario cair.
+                const uint8_t *tY = decframe->data[0];
+                int tPitch = decframe->linesize[0];
+                const uint8_t *tUV = decframe->data[1];
+                int tUVPitch = decframe->linesize[1];
+                if (m_ccOn)
+                {
+                    m_cc.push(tY, tPitch, tUV, tUVPitch);
+                    if (!m_cc.pop(m_ccOut, m_ccW, m_ccK,
+                                  &m_lastUV, &m_lastUVPitch))
+                    {
+                        outFrame = nullptr;
+                        return true;        // enchendo a janela, nao e erro
+                    }
+                    tY = m_ccOut;
+                    tPitch = m_ccW;
+                    tUV = m_lastUV;         // croma do MESMO quadro que o luma
+                    tUVPitch = m_lastUVPitch;
+                }
+                ok = m_rtx.processGpuNV12ToP010(tY, tPitch, tUV, tUVPitch,
                                                 enc_hw, m_bt2020);
             }
             else
