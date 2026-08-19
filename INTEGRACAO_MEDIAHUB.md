@@ -41,8 +41,10 @@ e quem já tem o velho pega o novo pelo mesmo caminho de instalação de
 ferramenta que o `tools.rs` usa (`ToolSpec` → baixa zip → extrai →
 `<app_data>/bin`).
 
-Binário: `F:\CLAUDE\rtx-worker-fork\build-mod\RTXVideoProcessor.exe`
-(30,4 MB). Vai junto, como já vai hoje: `nvngx_vsr.dll` e
+Fonte: **github.com/guilhermebarony-coder/rtx-video-worker** (privado até
+o LICENSE ser revisado; MIT, com o copyright do autor original
+preservado). Binário local:
+`F:\CLAUDE\rtx-worker-fork\build-mod\RTXVideoProcessor.exe` (30,4 MB). Vai junto, como já vai hoje: `nvngx_vsr.dll` e
 `nvngx_truehdr.dll`.
 
 ### 2. Empacotar os pesos
@@ -135,8 +137,15 @@ O ramo do THDR **ignorava o filtro em silêncio** até hoje — aceitava
 `--cc-blob`, registrava "CodecClean ON" e não aplicava nada. Como o
 Media Hub liga THDR quando o usuário pede HDR (`if !hdr { --no-thdr }`,
 `rtx.rs:713`), esse era o caminho mais provável de o usuário cair.
-Consertado e coberto por gate. **Não use binário mais velho que
-`8255d70`.**
+Consertado e coberto por gate.
+
+> **Piso de versão: `888255f`** — *"o filtro era IGNORADO EM SILÊNCIO no
+> caminho do THDR"*. Qualquer binário anterior a esse commit tem o
+> defeito, **inclusive `8255d70`**, que este documento indicava por
+> engano até 19/08 18:40. Se o hash não bater com o que você vê no repo,
+> confira pelo ASSUNTO do commit: é ele que define o piso, não o número.
+>
+> Recomendado na prática: compile do `main`.
 
 ### Latência de 3 quadros
 
@@ -146,16 +155,54 @@ idênticos ao caminho sem filtro (provado por gate). **Não afeta o app** —
 só saiba que os 3 primeiros `process()` não produzem saída, e a barra de
 progresso já reflete isso.
 
-### Resolução fora de 720p: NÃO MEDIDO
+### Resolução fora de 720p: MEDIDO, e transfere
 
-O modelo foi treinado em 720p e os mapas de condicionamento têm grade de
-bloco fixa (4/8/16 px). O comportamento em 1080p, 480p ou 4K **não foi
-medido**. Num app onde o usuário joga qualquer arquivo, isso é o maior
-risco em aberto: o filtro não vai falhar, vai fazer *outra coisa*, e isso
-não aparece como erro.
+Era o maior risco em aberto — o modelo treinou em 720p e os mapas têm
+grade de bloco fixa (4/8/16 px). Medido em 19/08 (`eval/gate_resolucao.py`:
+master limpo → escala → VP9 2-pass com bitrate escalado por pixel, para a
+severidade por bloco ficar comparável):
 
-**Recomendação: medir antes de liberar**, e se a dose fugir, reamostrar
-para 720p antes de filtrar ou avisar na UI.
+| resolução | dose \|d\| | viés | p99 | vs 720p |
+|---|---|---|---|---|
+| 480p | 1,778 | −1,640 | 6,0 | 1,02× |
+| 720p | 1,735 | −1,644 | 5,0 | 1,00× |
+| 1080p | 1,684 | −1,644 | 4,0 | 0,97× |
+| 2160p | 1,646 | −1,641 | 3,0 | 0,95× |
+
+**A dose é plana e o viés de brilho bate em três casas nas quatro.** O
+mecanismo: bloco de compressão tem tamanho fixo em *pixel codificado*
+(16×16 macrobloco, 8×8 e 4×4 transformada) em qualquer resolução, então a
+grade dos mapas casa igual. O p99 cair de 6 para 3 é coerente — em 4K o
+mesmo bloco cobre menos desenho.
+
+**Nenhuma ação necessária na UI.** Não precisa travar em 720p nem avisar.
+
+*Ainda não medido:* material 720p **esticado** para 1080p antes de
+filtrar — ali o artefato fica 1,5× maior que a grade espera. Caso
+diferente de "arquivo nativo em 1080p", que é o testado acima.
+
+---
+
+## Preview de um quadro (novo, 19/08)
+
+A agulha para num quadro e sai a imagem filtrada, sem renderizar o vídeo:
+`eval/preview_frame.py` recorta N−3..N+3, roda o worker pelo **caminho de
+produção** e puxa o do meio.
+
+**~1,2 s por quadro — e 1,12 s disso é o worker iniciando** (CUDA + NGX).
+Filtrar os 7 quadros custa ~0,1 s. Num app que mantenha o processo vivo
+entre chamadas, o slider de força atualiza praticamente ao vivo.
+
+A flag `--frame-offset N` diz ao worker qual é o índice absoluto do
+primeiro quadro do recorte. Sem ela o dither usaria a semente do recorte
+e o preview sairia ±1 de luma diferente da entrega. Com ela o preview é
+**bit a bit** o pixel que o render vai produzir — provado em
+`eval/gate_preview.py`, 4 quadros, zero diferenças.
+
+> **O preview não valida o render.** Defeito de fluxo — quadro perdido,
+> duplicado, fora de ordem — é invisível num quadro único, por
+> construção. Ele julga a DOSE; quem valida o render é o gate de
+> integração.
 
 ---
 
