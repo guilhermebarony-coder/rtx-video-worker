@@ -1,4 +1,5 @@
 #include "config_parser.h"
+#include "build_version.h"
 #include "logger.h"
 #include "utils.h"
 

@@ -568,6 +568,25 @@ int run_pipeline(PipelineConfig cfg)
         }
         else
         {
+            // MESMA LEI DO RAMO DE CIMA, que ate 19/08 so valia la: o
+            // filtro e CUDA e NAO existe no caminho de CPU, entao pedi-lo
+            // aqui e ERRO, nao bypass silencioso. Medido: com --cpu o
+            // worker aceitava --cc-blob e entregava o video sem filtro
+            // nenhum, sem uma palavra.
+            //
+            // A mensagem cita as DUAS causas porque a segunda e
+            // impossivel de adivinhar: alem do --cpu explicito, o worker
+            // cai para CPU sozinho quando o decode por hardware nao
+            // inicializa (use_cuda_path = hw_device_ctx && !cpuOnly).
+            if (!cfg.ccBlob.empty())
+            {
+                throw std::runtime_error(
+                    "CodecClean (--cc-blob) pedido, mas o processamento caiu "
+                    "no caminho de CPU e o filtro e CUDA. Causa: --cpu "
+                    "explicito, ou o decode por hardware nao inicializou "
+                    "para esta entrada. Rode sem --cc-blob, ou resolva o "
+                    "decode por hardware.");
+            }
             auto cpuProc = std::make_unique<CpuProcessor>(rtx, in.vdec->width, in.vdec->height, dstW, dstH);
             // Create a modified config for CPU processor to ensure it uses HDR pixel formats when outputting HDR
             RTXProcessConfig cpuConfig = cfg.rtxCfg;

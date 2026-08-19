@@ -34,12 +34,37 @@ argumentos.**
 
 ### 1. Publicar o binário novo
 
-O worker é um **sidecar baixado sob demanda** para `<app_data>/bin/`
-(`worker_path()` em `rtx.rs:242`), não algo empacotado no app. Então
-atualizar é **publicar um binário novo**, não reempacotar o Media Hub —
-e quem já tem o velho pega o novo pelo mesmo caminho de instalação de
-ferramenta que o `tools.rs` usa (`ToolSpec` → baixa zip → extrai →
-`<app_data>/bin`).
+O worker mora em `<app_data>/bin/` e o app checa presença com
+`worker_path()` (`rtx.rs:242`).
+
+> **CORREÇÃO (19/08 19:10).** A primeira versão deste documento dizia que
+> o worker é "um sidecar baixado sob demanda" e que atualizar seria só
+> publicar um binário. **Não é verdade hoje.** Verificado: `tools.rs` tem
+> exatamente dois `ToolSpec` — ffmpeg e deno. **Não existe downloader do
+> worker.** O `rtx_worker_status` só faz `is_file()`, e a UI diz "baixe o
+> enhancer primeiro" sem rota atrás do botão.
+>
+> Eu escrevi aquilo a partir do *comentário* no topo do `rtx.rs` ("driven
+> as a lazy-downloaded sidecar") e do lugar onde o arquivo mora — sem
+> verificar que o downloader existia. Comentário descreve intenção;
+> código descreve o que acontece.
+
+**Então a rota de instalação precisa ser construída**, e ela tem dois
+requisitos que não dá para deixar para depois:
+
+1. **Marcador de versão.** O `ensure()` do `tools.rs` (linha 113) decide
+   por *existência de arquivo*: `if is_file() { return }`. Publicar
+   binário novo na mesma URL **não alcança quem já tem um**. O binário
+   instalado na máquina do Gui hoje é de **5 de julho** (22.383.104 B) —
+   o que ignora o filtro em silêncio no caminho do THDR.
+2. **O blob junto.** 310 KB, mesmo diretório.
+
+Para comparar versão, o worker agora carimba a identidade **do git, a
+cada build**: `--version` reporta `v0.2.0-13-g997fb8d-dirty
+(2026.08.19.2159)`. Antes ele reportava o horário do último `cmake
+configure`, que congelava em builds incrementais — um exe linkado às
+17:52 dizia 13:07. Se o instalador for comparar versão, ele precisava
+disso primeiro.
 
 Fonte: **github.com/guilhermebarony-coder/rtx-video-worker** (privado até
 o LICENSE ser revisado; MIT, com o copyright do autor original
@@ -146,6 +171,21 @@ Consertado e coberto por gate.
 > confira pelo ASSUNTO do commit: é ele que define o piso, não o número.
 >
 > Recomendado na prática: compile do `main`.
+
+### O filtro não existe no caminho de CPU
+
+`--cc-blob` com o processamento em CPU = **ERRO**, não bypass silencioso.
+O filtro é CUDA e não roda ali.
+
+**O gatilho não é só a flag `--cpu`**:
+`use_cuda_path = (hw_device_ctx != nullptr) && !cpuOnly`. Decode por
+hardware que não inicialize — codec exótico, driver, arquivo estranho —
+derruba para CPU sozinho. Até 19/08 esse caminho aceitava `--cc-blob`,
+registrava "CodecClean ON" e entregava o vídeo sem filtro nenhum.
+
+Para o app: se o worker sair com essa mensagem, é sinal de que o decode
+por hardware falhou para aquele arquivo — vale surfaçar isso ao usuário
+em vez de tratar como erro genérico.
 
 ### Latência de 3 quadros
 

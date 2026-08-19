@@ -29,9 +29,21 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Version from build timestamp
-string(TIMESTAMP BUILD_VERSION "%Y.%m.%d.%H%M" UTC)
-add_compile_definitions(BUILD_VERSION="${BUILD_VERSION}")
-message(STATUS "Build version: ${BUILD_VERSION}")
+# A VERSAO VEM DO GIT E E REGERADA A CADA BUILD. O que estava aqui era
+# `string(TIMESTAMP ...)`, avaliado no CONFIGURE: builds incrementais nao
+# re-rodam o configure, entao a string congelava e o binario mentia sobre
+# a propria identidade (medido: exe de 17:52 reportando 13:07). Um
+# instalador com nocao de versao depende disto para nao comparar string
+# velha.
+set(VERSION_HEADER_DIR "${CMAKE_BINARY_DIR}/generated")
+set(VERSION_HEADER "${VERSION_HEADER_DIR}/build_version.h")
+file(MAKE_DIRECTORY "${VERSION_HEADER_DIR}")
+add_custom_target(stamp_version ALL
+  COMMAND ${CMAKE_COMMAND}
+          -DOUT=${VERSION_HEADER} -DSRC=${CMAKE_SOURCE_DIR}
+          -P ${CMAKE_SOURCE_DIR}/cmake/StampVersion.cmake
+  BYPRODUCTS ${VERSION_HEADER}
+  COMMENT "Carimbando a versao a partir do git")
 
 # Build configuration options
 option(USE_STATIC_FFMPEG "Link FFmpeg statically (requires vcpkg or static FFmpeg build)" OFF)
@@ -178,6 +190,8 @@ file(GLOB RVP_HEADERS
 )
 
 add_executable(RTXVideoProcessor ${RVP_SOURCES} ${RVP_HEADERS})
+add_dependencies(RTXVideoProcessor stamp_version)
+target_include_directories(RTXVideoProcessor PRIVATE ${VERSION_HEADER_DIR})
 
 # Ensure CUDA source files build cleanly with NVCC on the final exe (so device link runs)
 set_target_properties(RTXVideoProcessor PROPERTIES
