@@ -96,6 +96,12 @@ public:
     // lado de Python.
     void markEnd() { m_ended = true; }
 
+    // Indice ABSOLUTO do primeiro quadro entregue. So o DITHER usa isto
+    // (ele e semeado pelo indice do quadro). Serve para um recorte de 7
+    // quadros produzir o MESMO pixel que o render inteiro produziria —
+    // e o que faz um preview ser bit-identico a entrega.
+    void setFrameOffset(long long off) { m_frameOffset = off; }
+
     int width() const { return m_w; }
     int height() const { return m_h; }
 
@@ -109,6 +115,7 @@ private:
     // Copia dos pesos no HOST: o modo 3 passa peso por parametro de
     // kernel, e o driver copia do lado de ca a cada lancamento.
     float *m_hostW = nullptr;
+    long long m_frameOffset = 0;   // indice absoluto do 1o quadro
     long long m_pushed = 0;   // quantos quadros entraram
     long long m_popped = 0;   // quantos sairam
     bool m_ended = false;

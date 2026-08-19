@@ -45,7 +45,7 @@ public:
     // cedo — o mesmo modo de falha do iter 92/93, que nao aparece como
     // erro porque o arquivo abre e roda.
     bool enableCodecClean(const std::string &blob, float strength,
-                          int w, int h)
+                          int w, int h, long long frameOffset = 0)
     {
         if (blob.empty())
             return true;                    // desligado: nada muda
@@ -54,6 +54,7 @@ public:
         // buffer enquanto os kernels ainda escreviam.
         if (!m_cc.init(blob.c_str(), w, h, m_rtx.stream()))
             return false;
+        m_cc.setFrameOffset(frameOffset);
         m_ccOn = true;
         m_ccK = strength;
         m_ccW = w;

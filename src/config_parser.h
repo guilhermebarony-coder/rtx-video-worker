@@ -23,6 +23,10 @@ struct PipelineConfig
     // preset (os campos abaixo valem como estao). Ver a resolucao no
     // fim de parse_config, que e onde a regra do cano tambem age.
     std::string quality;
+    // Indice absoluto do 1o quadro da entrada (--frame-offset). So o
+    // dither do CodecClean usa; existe para preview de um quadro sair
+    // bit-identico ao render.
+    long long ccFrameOffset = 0;
     // Flag explicita ganha do preset: sem estas duas, `--quality master
     // --nvenc-qp 20` daria 12 e o usuario nao entenderia por que.
     bool qpExplicit = false;

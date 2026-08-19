@@ -555,7 +555,8 @@ int run_pipeline(PipelineConfig cfg)
             if (!cfg.ccBlob.empty())
             {
                 if (!gp->enableCodecClean(cfg.ccBlob, cfg.ccStrength,
-                                          in.vdec->width, in.vdec->height))
+                                          in.vdec->width, in.vdec->height,
+                                          cfg.ccFrameOffset))
                     throw std::runtime_error("CodecClean: falha ao carregar "
                                              + cfg.ccBlob);
                 LOG_VERBOSE("CodecClean ON: %s, strength %.2f, %dx%d "

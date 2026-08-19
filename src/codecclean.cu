@@ -964,7 +964,11 @@ void CodecCleanFilter::runNetwork(int centro, float strength,
                  hp(m_wOut), hp(m_bOut));
 
     // --- composicao: deg + k*residuo, com dither e soma em double ------
-    k_dither<<<grd, blk, 0, st>>>(m_noise, W, H, (unsigned)centro);
+    // A semente e o indice ABSOLUTO no video, nao a posicao dentro
+    // desta execucao: so assim um recorte de 7 quadros gera o mesmo
+    // ruido que o render inteiro geraria naquele quadro.
+    k_dither<<<grd, blk, 0, st>>>(m_noise, W, H,
+                                  (unsigned)(centro + m_frameOffset));
     k_compose<<<grd, blk, 0, st>>>(dCentro, W, m_res, m_noise,
                                    d_out, outPitch, strength, W, H);
 }

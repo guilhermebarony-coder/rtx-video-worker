@@ -127,6 +127,8 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 25 (env: RTX_THDR_MIDDLE_GRAY)\n");
     fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000 (env: RTX_THDR_MAX_LUMINANCE)\n");
     fprintf(stderr, "\nNVENC options:\n");
+    fprintf(stderr, "  --frame-offset      Absolute index of the first input frame\n");
+    fprintf(stderr, "                      (CodecClean dither seed; for exact previews)\n");
     fprintf(stderr, "  --quality           Quality preset: lossless|master|entrega|previa\n");
     fprintf(stderr, "                      (env: RTX_QUALITY). Pipe output defaults to lossless.\n");
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq (env: RTX_NVENC_TUNE)\n");
@@ -787,6 +789,15 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->rtxCfg.thdrMaxLuminance = std::stoi(argv[++i]);
         }
+        else if (arg == "--frame-offset")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--frame-offset requires an argument\n");
+                exit(1);
+            }
+            cfg->ccFrameOffset = std::stoll(argv[++i]);
+        }
         else if (arg == "--quality")
         {
             if (i + 1 >= argc)
@@ -1032,6 +1043,15 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
         }
 
         // VSR
+        else if (arg == "--frame-offset")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--frame-offset requires an argument\n");
+                exit(1);
+            }
+            cfg->ccFrameOffset = std::stoll(argv[++i]);
+        }
         else if (arg == "--quality")
         {
             if (i + 1 < argc)
