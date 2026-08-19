@@ -398,11 +398,24 @@ AVBufferRef *configure_video_encoder(PipelineConfig &cfg, InputContext &in, Outp
     }
     // CQP mode ignores bitrate, uses QP instead
 
-    av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+    // AQ e LOOKAHEAD sao incompativeis com lossless: o NVENC recusa a
+    // inicializacao com "Adaptive quantization is not supported with
+    // lossless encoding". Sem esta guarda, `--nvenc-tune lossless` —
+    // que a ajuda anuncia — aborta o programa, e era o caso ate 19/08.
+    const bool lossless = (cfg.tune == "lossless");
+    if (!lossless)
+    {
+        av_opt_set(out.venc->priv_data, "temporal-aq", "1", 0);
+        // Reduced from 8 to 4 to halve lookahead memory usage while maintaining quality benefits
+        av_opt_set_int(out.venc->priv_data, "rc-lookahead", 4, 0);
+    }
+    else
+    {
+        LOG_VERBOSE("Encoder LOSSLESS: temporal-aq e rc-lookahead desligados "
+                    "(o NVENC nao aceita AQ com lossless)");
+    }
     // Reduced from 4 to 2 for better VRAM efficiency (supports 4K→8K upscaling within 12GB VRAM)
     av_opt_set_int(out.venc->priv_data, "async_depth", 2, 0);
-    // Reduced from 8 to 4 to halve lookahead memory usage while maintaining quality benefits
-    av_opt_set_int(out.venc->priv_data, "rc-lookahead", 4, 0);
 
     // Apply advanced keyframe control options
     if (cfg.scThreshold >= 0)
