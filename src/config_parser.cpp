@@ -108,6 +108,7 @@ void print_help(const char *argv0)
     fprintf(stderr, "  - Local file: output.mp4, output.mkv, output.m3u8\n");
     fprintf(stderr, "  - Stdout pipe: - or pipe:1\n");
     fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "      --version Print the build version to stdout and exit 0\n");
     fprintf(stderr, "  -v, --verbose Enable verbose logging\n");
     fprintf(stderr, "  -d, --debug Enable debug logging\n");
     fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
@@ -799,6 +800,15 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->ccFrameOffset = std::stoll(argv[++i]);
         }
+        else if (arg == "--version" || arg == "-version")
+        {
+            // No STDOUT e sem mais nada: isto e um VALOR, para um script
+            // ler. A ajuda vai para stderr porque e diagnostico; versao
+            // nao e. E sai 0 — um instalador que compare versao nao pode
+            // receber codigo de erro de uma pergunta que funcionou.
+            printf("%s\n", BUILD_VERSION);
+            exit(0);
+        }
         else if (arg == "--quality")
         {
             if (i + 1 >= argc)
@@ -1052,6 +1062,15 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
                 exit(1);
             }
             cfg->ccFrameOffset = std::stoll(argv[++i]);
+        }
+        else if (arg == "--version" || arg == "-version")
+        {
+            // No STDOUT e sem mais nada: isto e um VALOR, para um script
+            // ler. A ajuda vai para stderr porque e diagnostico; versao
+            // nao e. E sai 0 — um instalador que compare versao nao pode
+            // receber codigo de erro de uma pergunta que funcionou.
+            printf("%s\n", BUILD_VERSION);
+            exit(0);
         }
         else if (arg == "--quality")
         {
@@ -1330,6 +1349,22 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
 
 void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
 {
+    // --version ANTES da checagem de argumentos: ele e uma pergunta que
+    // se responde sozinha, sem entrada nem saida. Estava depois, no laco
+    // de flags, e por isso `--version` sozinho caia no `argc < 3`,
+    // cuspia a ajuda inteira e saia 1 — inutil para o instalador, que
+    // precisa exatamente disso para decidir se substitui o binario.
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "--version") == 0
+            || std::strcmp(argv[i], "-version") == 0)
+        {
+            // STDOUT e exit 0: e um VALOR, nao diagnostico.
+            printf("%s\n", BUILD_VERSION);
+            exit(0);
+        }
+    }
+
     if (argc < 3)
     {
         print_help(argv[0]);
