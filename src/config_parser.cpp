@@ -127,6 +127,8 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --thdr-middle-gray Set THDR middle gray, default 25 (env: RTX_THDR_MIDDLE_GRAY)\n");
     fprintf(stderr, "  --thdr-max-luminance Set THDR max luminance, default 1000 (env: RTX_THDR_MAX_LUMINANCE)\n");
     fprintf(stderr, "\nNVENC options:\n");
+    fprintf(stderr, "  --quality           Quality preset: lossless|master|entrega|previa\n");
+    fprintf(stderr, "                      (env: RTX_QUALITY). Pipe output defaults to lossless.\n");
     fprintf(stderr, "  --nvenc-tune        Set NVENC tune, default hq (env: RTX_NVENC_TUNE)\n");
     fprintf(stderr, "  --nvenc-preset      Set NVENC preset, default p7 (env: RTX_NVENC_PRESET)\n");
     fprintf(stderr, "  --nvenc-rc          Set NVENC rate control, default constqp (env: RTX_NVENC_RC)\n");
@@ -785,6 +787,39 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->rtxCfg.thdrMaxLuminance = std::stoi(argv[++i]);
         }
+        else if (arg == "--quality")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--quality requires an argument "
+                                "(lossless|master|entrega|previa)\n");
+                exit(1);
+            }
+            cfg->quality = argv[++i];
+        }
+        // --nvenc-qp e --nvenc-tune existiam SO no modo simples: quem usa
+        // `-i` nunca teve essas flags, so as variaveis de ambiente. E a
+        // --nvenc-qp nem no simples estava, apesar de anunciada na ajuda.
+        else if (arg == "--nvenc-qp")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--nvenc-qp requires an argument\n");
+                exit(1);
+            }
+            cfg->qp = std::stoi(argv[++i]);
+            cfg->qpExplicit = true;
+        }
+        else if (arg == "--nvenc-tune")
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "--nvenc-tune requires an argument\n");
+                exit(1);
+            }
+            cfg->tune = argv[++i];
+            cfg->tuneExplicit = true;
+        }
         // Detect output path: file extensions or pipe/stdout
         if (endsWith(arg, ".m3u8") || endsWith(arg, ".mp4") || endsWith(arg, ".mkv") ||
             arg == "-" || arg == "pipe:" || arg == "pipe:1")
@@ -997,6 +1032,34 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
         }
 
         // VSR
+        else if (arg == "--quality")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->quality = argv[++i];
+            }
+            else
+            {
+                fprintf(stderr, "--quality requires an argument "
+                                "(lossless|master|entrega|previa)\n");
+                exit(1);
+            }
+        }
+        // --nvenc-qp ESTAVA NA AJUDA E NAO NO PARSER ate 19/08: o worker
+        // cuspia a ajuda e saia. So RTX_NVENC_QP funcionava.
+        else if (arg == "--nvenc-qp")
+        {
+            if (i + 1 < argc)
+            {
+                cfg->qp = std::stoi(argv[++i]);
+                cfg->qpExplicit = true;
+            }
+            else
+            {
+                fprintf(stderr, "--nvenc-qp requires an argument\n");
+                exit(1);
+            }
+        }
         else if (arg == "--no-vsr")
             cfg->rtxCfg.enableVSR = false;
         else if (arg == "--no-vsr-yuv-restore")
@@ -1098,6 +1161,7 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
             if (i + 1 < argc)
             {
                 cfg->tune = argv[++i];
+                cfg->tuneExplicit = true;
             }
             else
             {
@@ -1264,8 +1328,13 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->rtxCfg.thdrMiddleGray = get_env_int("RTX_THDR_MIDDLE_GRAY", 25);
     cfg->rtxCfg.thdrMaxLuminance = get_env_int("RTX_THDR_MAX_LUMINANCE", 1000);
 
+    const char *env_qual = get_env_var("RTX_QUALITY");
+    cfg->quality = env_qual ? env_qual : "";
     const char *env_tune = get_env_var("RTX_NVENC_TUNE");
     cfg->tune = env_tune ? env_tune : "hq";
+    // Tune vindo do ambiente conta como explicito: quem exportou
+    // RTX_NVENC_TUNE pediu aquilo, e o preset nao deve passar por cima.
+    cfg->tuneExplicit = (env_tune != nullptr);
     const char *env_preset = get_env_var("RTX_NVENC_PRESET");
     cfg->preset = env_preset ? env_preset : "p7";
     const char *env_rc = get_env_var("RTX_NVENC_RC");
@@ -1273,6 +1342,7 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     cfg->gop = get_env_int("RTX_NVENC_GOP", 3);
     cfg->bframes = get_env_int("RTX_NVENC_BFRAMES", 2);
     cfg->qp = get_env_int("RTX_NVENC_QP", 21);
+    cfg->qpExplicit = (get_env_var("RTX_NVENC_QP") != nullptr);
     cfg->targetBitrateMultiplier = get_env_int("RTX_NVENC_BITRATE_MULTIPLIER", 2);
     cfg->targetBitrate = get_env_int64("RTX_NVENC_BITRATE", -1);
     cfg->maxBitrate = get_env_int64("RTX_NVENC_MAXRATE", -1);
@@ -1300,6 +1370,64 @@ void parse_arguments(int argc, char **argv, PipelineConfig *cfg)
     {
         // Simple mode (positional input/output)
         parse_simple_mode(argc, argv, cfg);
+    }
+
+    // PRESET DE QUALIDADE, resolvido AQUI porque so agora se sabe
+    // tudo: o preset do ambiente, o da linha de comando, as flags
+    // explicitas e o caminho de saida.
+    //
+    // A REGRA DO CANO: saida por cano e intermediario POR CONSTRUCAO —
+    // alguem adiante vai encodar de novo. Pagar perda ali nunca esta
+    // certo, e era a perda que esta cadeia pagava calada (QP 21 no
+    // meio, que o Gui viu de imediato ao dar play num render).
+    if (cfg->quality.empty() && cfg->outputPath
+        && is_pipe_output(cfg->outputPath) && !cfg->qpExplicit
+        && !cfg->tuneExplicit)
+    {
+        cfg->quality = "lossless";
+        LOG_VERBOSE("Saida por cano: qualidade lossless por padrao "
+                    "(intermediario nao deve perder). Use --quality para "
+                    "escolher outra.");
+    }
+
+    if (!cfg->quality.empty())
+    {
+        // Degraus medidos em 19/08 (clipe de 60 s, filtro + VSR 2x):
+        //   lossless  1895 MB/min, +22% de tempo
+        //   master 12  190 MB/min
+        //   entrega 15  94 MB/min
+        //   previa 25   18 MB/min
+        // O TEMPO E PLANO de qp 12 a qp 30 — o degrau e tamanho, nao
+        // velocidade. Por isso nenhum preset existe "para ser rapido".
+        int presetQp = -1;
+        const char *presetTune = nullptr;
+        if (cfg->quality == "lossless")
+            presetTune = "lossless";
+        else if (cfg->quality == "master")
+            presetQp = 12;
+        else if (cfg->quality == "entrega")
+            presetQp = 15;
+        else if (cfg->quality == "previa")
+            presetQp = 25;
+        else
+        {
+            fprintf(stderr, "--quality desconhecido: '%s' "
+                            "(use lossless|master|entrega|previa)\n",
+                    cfg->quality.c_str());
+            exit(1);
+        }
+
+        // Flag explicita ganha do preset, sempre.
+        if (presetTune && !cfg->tuneExplicit)
+            cfg->tune = presetTune;
+        if (presetQp >= 0 && !cfg->qpExplicit)
+        {
+            cfg->qp = presetQp;
+            cfg->rc = "constqp";
+        }
+        LOG_VERBOSE("Preset de qualidade '%s': tune=%s rc=%s qp=%d",
+                    cfg->quality.c_str(), cfg->tune.c_str(),
+                    cfg->rc.c_str(), cfg->qp);
     }
 
     // Single validation contract, applied AFTER every override source

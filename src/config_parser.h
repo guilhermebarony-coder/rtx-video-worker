@@ -19,6 +19,15 @@ struct PipelineConfig
     std::vector<std::string> inputPaths;  // Multiple input files (-i flag can be repeated)
 
     // NVENC settings
+    // Preset de qualidade: amarra tune/rc/qp num nome so. Vazio = sem
+    // preset (os campos abaixo valem como estao). Ver a resolucao no
+    // fim de parse_config, que e onde a regra do cano tambem age.
+    std::string quality;
+    // Flag explicita ganha do preset: sem estas duas, `--quality master
+    // --nvenc-qp 20` daria 12 e o usuario nao entenderia por que.
+    bool qpExplicit = false;
+    bool tuneExplicit = false;
+
     std::string tune;
     std::string preset;
     std::string rc; // cbr, vbr, constqp
