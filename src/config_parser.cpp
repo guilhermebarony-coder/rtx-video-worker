@@ -112,6 +112,11 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --cpu         Bypass GPU for video processing pipeline other than RTX processing\n");
     fprintf(stderr, "\nVSR options:\n");
     fprintf(stderr, "  --no-vsr      Disable VSR (env: RTX_NO_VSR=1)\n");
+    fprintf(stderr, "\nCodecClean options (compression-residual filter, BEFORE VSR):\n");
+    fprintf(stderr, "  --cc-blob <file>      Filter weights. Without it the filter is OFF\n");
+    fprintf(stderr, "                        and the worker behaves exactly as before.\n");
+    fprintf(stderr, "  --cc-strength <k>     Strength 0..1 (default 1.0). k=0 is EXACT bypass.\n");
+    fprintf(stderr, "                        Adds 3-frame latency (7-frame centered window).\n");
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4 (env: RTX_VSR_QUALITY)\n");
     fprintf(stderr, "  --vsr-scale       Output scale factor 1-4, default 2 (env: RTX_VSR_SCALE)\n");
     fprintf(stderr, "  --no-vsr-yuv-restore  Disable OOG-safe residual reconstruction on the SDR VSR path (env: RTX_NO_VSR_YUV_RESTORE=1)\n");
@@ -193,6 +198,14 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             {
                 cfg->outputFormatName = argv[++i];
             }
+        }
+        else if (arg == "--cc-blob")
+        {
+            cfg->ccBlob = argv[++i];
+        }
+        else if (arg == "--cc-strength")
+        {
+            cfg->ccStrength = (float)atof(argv[++i]);
         }
         else if (arg == "-i")
         {
@@ -798,6 +811,17 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
             cfg->debug = true;
         else if (arg == "--cpu" || arg == "-cpu")
             cfg->cpuOnly = true;
+        // CodecClean: precisa existir nos DOIS parsers. O `-f` so mora no
+        // modo compatibilidade, e por isso "nao funcionava" no posicional
+        // — nao repetir o mesmo tropeco com uma flag nova.
+        else if (arg == "--cc-blob")
+        {
+            cfg->ccBlob = argv[++i];
+        }
+        else if (arg == "--cc-strength")
+        {
+            cfg->ccStrength = (float)atof(argv[++i]);
+        }
         else if (arg == "--help" || arg == "-h")
         {
             print_help(argv[0]);

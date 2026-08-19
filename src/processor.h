@@ -2,6 +2,7 @@
 
 extern "C"
 {
+#include "codecclean.cuh"
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixfmt.h>
@@ -22,6 +23,10 @@ public:
     // Returns false on failure.
     virtual bool process(const AVFrame *decframe, AVFrame *&outFrame) = 0;
     virtual void shutdown() = 0;
+    // Filtro com janela (CodecClean). Default: nao ha nada preso.
+    virtual void filterMarkEnd() {}
+    virtual bool filterDrain(AVFrame *&outFrame) { outFrame = nullptr; return false; }
+    virtual bool codecCleanOn() const { return false; }
 };
 
 class GpuProcessor : public IProcessor
@@ -29,6 +34,67 @@ class GpuProcessor : public IProcessor
 public:
     GpuProcessor(RTXProcessor &rtx, CudaFramePool &pool, AVColorSpace colorSpace, bool thdrEnabled, bool inputIsHDR = false)
         : m_rtx(rtx), m_pool(pool), m_bt2020(colorSpace == AVCOL_SPC_BT2020_NCL), m_thdrEnabled(thdrEnabled), m_inputIsHDR(inputIsHDR) {}
+
+    // CodecClean: filtra o LUMA antes do VSR. Sem blob, nao faz nada e
+    // o caminho e o de sempre — bit a bit.
+    //
+    // A JANELA E DE 7 QUADROS CENTRADA, entao o filtro so pode entregar
+    // o quadro i depois de ver o i+3. Isso e LATENCIA DE 3 QUADROS num
+    // pipeline que hoje e 1:1 depth 0, e quem chama tem que drenar no
+    // fim (`filterDrain`). Sem drenar, o video termina 3 quadros mais
+    // cedo — o mesmo modo de falha do iter 92/93, que nao aparece como
+    // erro porque o arquivo abre e roda.
+    bool enableCodecClean(const std::string &blob, float strength,
+                          int w, int h)
+    {
+        if (blob.empty())
+            return true;                    // desligado: nada muda
+        // MESMO stream do VSR: ele e non-blocking e nao sincroniza
+        // com o stream 0. Rodar o filtro no 0 deixava o VSR ler o
+        // buffer enquanto os kernels ainda escreviam.
+        if (!m_cc.init(blob.c_str(), w, h, m_rtx.stream()))
+            return false;
+        m_ccOn = true;
+        m_ccK = strength;
+        m_ccW = w;
+        m_ccH = h;
+        if (cudaMalloc(&m_ccOut, (size_t)w * h) != cudaSuccess)
+            return false;
+        return true;
+    }
+
+    bool codecCleanOn() const override { return m_ccOn; }
+
+    // Fim da entrada: os ultimos quadros passam a poder sair com a
+    // vizinhanca clampada, como nas pontas do lado de Python.
+    void filterMarkEnd() override { if (m_ccOn) m_cc.markEnd(); }
+
+    // Produz o proximo quadro preso na janela. Devolve false quando
+    // acabou. **Quem chama TEM que drenar ate false** — senao o video
+    // termina 3 quadros mais cedo, e isso nao aparece como erro.
+    bool filterDrain(AVFrame *&outFrame) override
+    {
+        outFrame = nullptr;
+        if (!m_ccOn)
+            return false;
+        // Pergunta ANTES de adquirir: o pool e circular e cada
+        // acquire() recicla um slot. Adquirir para so entao
+        // descobrir que nao ha saida consumiria um slot a toa.
+        if (m_cc.available() <= 0)
+            return false;
+        AVFrame *enc_hw = m_pool.acquire();
+        if (!m_cc.pop(m_ccOut, m_ccW, m_ccK, &m_lastUV, &m_lastUVPitch))
+        {
+            return false;
+        }
+        if (!m_rtx.processGpuNV12ToNV12(m_ccOut, m_ccW, m_lastUV, m_lastUVPitch,
+                                        enc_hw, m_bt2020))
+        {
+            return false;
+        }
+        outFrame = enc_hw;
+        return true;
+    }
 
     bool process(const AVFrame *decframe, AVFrame *&outFrame) override
     {
@@ -96,8 +162,30 @@ public:
             }
             else
             {
-                ok = m_rtx.processGpuNV12ToNV12(decframe->data[0], decframe->linesize[0],
-                                                decframe->data[1], decframe->linesize[1],
+                const uint8_t *srcY = decframe->data[0];
+                int srcPitch = decframe->linesize[0];
+                if (m_ccOn)
+                {
+                    // A janela come o quadro e devolve o de 3 atras. Se
+                    // ainda nao ha saida (os 3 primeiros), este quadro
+                    // NAO produz saida — quem chama trata via
+                    // `filterPending`.
+                    m_cc.push(srcY, srcPitch,
+                              decframe->data[1], decframe->linesize[1]);
+                    if (!m_cc.pop(m_ccOut, m_ccW, m_ccK,
+                                  &m_lastUV, &m_lastUVPitch))
+                    {
+                        outFrame = nullptr;
+                        return true;        // sem saida AINDA, nao e erro
+                    }
+                    srcY = m_ccOut;
+                    srcPitch = m_ccW;
+                }
+                // Com o filtro, o croma vem do MESMO quadro que o luma
+                // (o ring devolve o par); sem filtro, do decframe atual.
+                const uint8_t *uvSrc = m_ccOn ? m_lastUV : decframe->data[1];
+                int uvPitch = m_ccOn ? m_lastUVPitch : decframe->linesize[1];
+                ok = m_rtx.processGpuNV12ToNV12(srcY, srcPitch, uvSrc, uvPitch,
                                                 enc_hw, m_bt2020);
             }
         }
@@ -115,6 +203,13 @@ private:
     bool m_bt2020 = false;
     bool m_thdrEnabled = false;
     bool m_inputIsHDR = false;
+    cc::CodecCleanFilter m_cc;
+    bool m_ccOn = false;
+    float m_ccK = 1.0f;
+    int m_ccW = 0, m_ccH = 0;
+    uint8_t *m_ccOut = nullptr;
+    const uint8_t *m_lastUV = nullptr;
+    int m_lastUVPitch = 0;
 };
 
 class CpuProcessor : public IProcessor

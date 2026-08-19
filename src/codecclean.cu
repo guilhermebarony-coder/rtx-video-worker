@@ -35,6 +35,9 @@
 //     plausivel e errada.
 
 #include "codecclean.cuh"
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 
 namespace cc
 {
@@ -244,6 +247,13 @@ __global__ void k_scale(float *__restrict__ x, float s, int n)
         x[i] = x[i] * s;
 }
 
+__global__ void k_fill(float *__restrict__ x, float v, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        x[i] = v;
+}
+
 // --------------------------------------------------------------- rede
 
 // Convolucao 3x3 generica, padding ZERO (o do nn.Conv2d(padding=1)) —
@@ -332,6 +342,243 @@ __global__ void k_compose(const uint8_t *__restrict__ deg, int pitchIn,
     if (q > 255.0)
         q = 255.0;
     out[y * pitchOut + x] = (uint8_t)q;
+}
+
+
+
+// ---------------------------------------------------------------------
+// Ruido de dither por hash de (quadro, x, y). Determinista, sem estado.
+// Um gerador com estado exigiria que a ordem dos quadros fosse fixa, e
+// aqui ela ja e — mas hash tambem sobrevive a reprocessar um quadro
+// isolado, que e util para depurar.
+__global__ void k_dither(float *__restrict__ out, int w, int h, unsigned frameIdx)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+        return;
+    unsigned s = frameIdx * 2654435761u ^ (unsigned)x * 2246822519u
+               ^ (unsigned)y * 3266489917u;
+    s ^= s >> 15; s *= 2246822519u;
+    s ^= s >> 13; s *= 3266489917u;
+    s ^= s >> 16;
+    out[y * w + x] = (float)(s >> 8) * (1.0f / 16777216.0f);  // [0,1)
+}
+
+// ---------------------------------------------------------------------
+
+#define CCK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) return false; } while (0)
+
+bool CodecCleanFilter::init(const char *blobPath, int w, int h, cudaStream_t stream)
+{
+    m_w = w; m_h = h; m_stream = stream;
+    m_pushed = m_popped = 0; m_ended = false;
+
+    FILE *f = fopen(blobPath, "rb");
+    if (!f)
+        return false;
+    char magia[8];
+    int hdr[4];
+    if (fread(magia, 1, 8, f) != 8 || memcmp(magia, "CCNET\0\0\0", 8) != 0
+        || fread(hdr, 4, 4, f) != 4)
+    { fclose(f); return false; }
+    m_ch = hdr[0]; m_bl = hdr[1]; m_cin = 7 + hdr[2];
+    if (m_bl > 8) { fclose(f); return false; }   // m_w1[] tem 8 slots
+
+    size_t nW = (size_t)m_ch * m_cin * 9 + m_ch;
+    for (int b = 0; b < m_bl; ++b) nW += 2 * ((size_t)m_ch * m_ch * 9 + m_ch);
+    nW += (size_t)m_ch * 9 + 1;
+    float *hostW = (float *)malloc(nW * 4);
+    if (!hostW || fread(hostW, 4, nW, f) != nW)
+    { free(hostW); fclose(f); return false; }
+    fclose(f);
+
+    const size_t N = (size_t)m_w * m_h;
+    bool ok = true;
+    ok &= cudaMalloc(&m_w8, nW * 4) == cudaSuccess;
+    ok &= cudaMalloc(&m_ring, 7 * N) == cudaSuccess;
+    // NV12: o plano de croma tem metade da altura e a mesma largura
+    ok &= cudaMalloc(&m_ringUV, 7 * (size_t)m_w * (m_h / 2)) == cudaSuccess;
+    ok &= cudaMalloc(&m_in, (size_t)m_cin * N * 4) == cudaSuccess;
+    ok &= cudaMalloc(&m_a, (size_t)m_ch * N * 4) == cudaSuccess;
+    ok &= cudaMalloc(&m_b, (size_t)m_ch * N * 4) == cudaSuccess;
+    ok &= cudaMalloc(&m_c, (size_t)m_ch * N * 4) == cudaSuccess;
+    for (float **p : {&m_f, &m_f2, &m_t1, &m_t2, &m_acc, &m_soma, &m_res, &m_noise})
+        ok &= cudaMalloc(p, N * 4) == cudaSuccess;
+    if (!ok) { free(hostW); destroy(); return false; }
+
+    cudaMemcpy(m_w8, hostW, nW * 4, cudaMemcpyHostToDevice);
+    free(hostW);
+
+    // offsets na MESMA ordem do dump_blob — contrato, nao convencao
+    size_t o = 0;
+    m_wInp = m_w8 + o; o += (size_t)m_ch * m_cin * 9;
+    m_bInp = m_w8 + o; o += m_ch;
+    for (int b = 0; b < m_bl; ++b) {
+        m_w1[b] = m_w8 + o; o += (size_t)m_ch * m_ch * 9;
+        m_b1[b] = m_w8 + o; o += m_ch;
+        m_w2[b] = m_w8 + o; o += (size_t)m_ch * m_ch * 9;
+        m_b2[b] = m_w8 + o; o += m_ch;
+    }
+    m_wOut = m_w8 + o; o += (size_t)m_ch * 9;
+    m_bOut = m_w8 + o;
+    return true;
+}
+
+void CodecCleanFilter::destroy()
+{
+    for (void *p : {(void *)m_w8, (void *)m_ring, (void *)m_ringUV,
+                    (void *)m_in, (void *)m_a,
+                    (void *)m_b, (void *)m_c, (void *)m_f, (void *)m_f2,
+                    (void *)m_t1, (void *)m_t2, (void *)m_acc, (void *)m_soma,
+                    (void *)m_res, (void *)m_noise})
+        if (p) cudaFree(p);
+    m_w8 = nullptr; m_ring = nullptr; m_ringUV = nullptr;
+    m_in = m_a = m_b = m_c = nullptr;
+    m_f = m_f2 = m_t1 = m_t2 = m_acc = m_soma = m_res = m_noise = nullptr;
+}
+
+void CodecCleanFilter::push(const uint8_t *d_y, int pitchY,
+                            const uint8_t *d_uv, int pitchUV)
+{
+    const size_t N = (size_t)m_w * m_h;
+    const size_t NUV = (size_t)m_w * (m_h / 2);
+    int slot = (int)(m_pushed % 7);
+    cudaMemcpy2DAsync(m_ring + (size_t)slot * N, m_w, d_y, pitchY,
+                      m_w, m_h, cudaMemcpyDeviceToDevice, m_stream);
+    // O croma NAO passa pelo filtro (o modelo so mexe no luma), mas
+    // TEM que viajar junto: sem isso a cor sai 3 quadros a frente da
+    // imagem, e nem contagem nem PTS denunciam.
+    if (d_uv)
+        cudaMemcpy2DAsync(m_ringUV + (size_t)slot * NUV, m_w, d_uv, pitchUV,
+                          m_w, m_h / 2, cudaMemcpyDeviceToDevice, m_stream);
+    ++m_pushed;
+}
+
+int CodecCleanFilter::available() const
+{
+    // O quadro `c` so pode sair quando c+3 ja entrou. No fim da entrada
+    // a vizinhanca futura passa a ser CLAMPADA e todos podem sair.
+    long long pronto = m_ended ? m_pushed : (m_pushed - 3);
+    long long n = pronto - m_popped;
+    return n > 0 ? (int)n : 0;
+}
+
+bool CodecCleanFilter::pop(uint8_t *d_out, int outPitch, float strength,
+                           const uint8_t **d_uvOut, int *uvPitchOut)
+{
+    if (available() <= 0)
+        return false;
+    const int centro = (int)m_popped;
+    runNetwork(centro, strength, d_out, outPitch);
+    if (d_uvOut)
+    {
+        const size_t NUV = (size_t)m_w * (m_h / 2);
+        *d_uvOut = m_ringUV + (size_t)(centro % 7) * NUV;
+        if (uvPitchOut)
+            *uvPitchOut = m_w;
+    }
+    ++m_popped;
+    return true;
+}
+
+// O miolo: monta a entrada de 11 canais e roda a rede sobre o quadro
+// `centro` (indice ABSOLUTO). A vizinhanca e clampada em [0, ultimo],
+// igual ao lado de Python — nas pontas os indices repetem e caem no
+// mesmo slot do ring, sem caso especial.
+void CodecCleanFilter::runNetwork(int centro, float strength,
+                                  uint8_t *d_out, int outPitch)
+{
+    const int W = m_w, H = m_h;
+    const size_t N = (size_t)W * H;
+    dim3 blk(32, 8), grd((W + 31) / 32, (H + 7) / 8);
+    int lin = (int)((N + 255) / 256);
+    cudaStream_t st = m_stream;
+
+    // ultimo quadro valido: durante o stream e o que ja entrou; depois
+    // do markEnd e o ultimo de todos.
+    long long ultimo = m_pushed - 1;
+
+    auto slotDe = [&](long long abs) -> const uint8_t * {
+        if (abs < 0) abs = 0;
+        if (abs > ultimo) abs = ultimo;
+        return m_ring + (size_t)(abs % 7) * N;
+    };
+
+    // --- canais 0..6: os 7 quadros normalizados 0..1 -------------------
+    for (int k = 0; k < 7; ++k)
+    {
+        const uint8_t *src = slotDe((long long)centro + k - 3);
+        k_u8_to_f32<<<grd, blk, 0, st>>>(src, W, m_in + (size_t)k * N,
+                                         nullptr, W, H);
+        k_scale<<<lin, 256, 0, st>>>(m_in + (size_t)k * N, 1.0f / 255.0f, (int)N);
+    }
+
+    // --- o quadro CENTRAL em 0..255, e o quadrado, para os mapas -------
+    const uint8_t *dCentro = slotDe(centro);
+    k_u8_to_f32<<<grd, blk, 0, st>>>(dCentro, W, m_f, m_f2, W, H);
+
+    // canal 7: bloco
+    k_seam<<<grd, blk, 0, st>>>(m_f, m_t1, W, H);
+    k_dilate3<<<grd, blk, 0, st>>>(m_t1, m_t2, W, H);
+    k_blur_h<<<grd, blk, 0, st>>>(m_t2, m_t1, W, H, 17);
+    k_blur_v<<<grd, blk, 0, st>>>(m_t1, m_in + (size_t)7 * N, W, H, 17);
+    k_clamp01_scale<<<lin, 256, 0, st>>>(m_in + (size_t)7 * N, 1.0f, (int)N);
+
+    // canal 8: flat
+    k_box7<<<grd, blk, 0, st>>>(m_f, m_t1, W, H);
+    k_box7<<<grd, blk, 0, st>>>(m_f2, m_t2, W, H);
+    k_flat<<<lin, 256, 0, st>>>(m_t1, m_t2, m_in + (size_t)8 * N, W, H);
+
+    // canal 9: grao — |hf(i) - hf(i-1)| para i em {2,3,4} da janela.
+    // A divisao por 3 vem ANTES do blur e o clamp DEPOIS: clampar antes
+    // corta picos que o blur ainda ia espalhar (bug pego pelo gate, que
+    // aparecia so no maximo e sumia na mediana).
+    cudaMemsetAsync(m_soma, 0, N * 4, st);
+    for (int i = 2; i <= 4; ++i)
+    {
+        for (int par = 0; par < 2; ++par)
+        {
+            const uint8_t *src = slotDe((long long)centro + (i - par) - 3);
+            k_u8_to_f32<<<grd, blk, 0, st>>>(src, W, m_f, nullptr, W, H);
+            k_blur_h<<<grd, blk, 0, st>>>(m_f, m_t1, W, H, 9);
+            k_blur_v<<<grd, blk, 0, st>>>(m_t1, m_t2, W, H, 9);
+            k_grain_acc<<<lin, 256, 0, st>>>(m_f, m_t2, m_acc, W, H, par == 0);
+        }
+        k_add<<<lin, 256, 0, st>>>(m_soma, m_acc, (int)N);
+    }
+    k_scale<<<lin, 256, 0, st>>>(m_soma, 1.0f / 3.0f, (int)N);
+    k_blur_h<<<grd, blk, 0, st>>>(m_soma, m_t1, W, H, 17);
+    k_blur_v<<<grd, blk, 0, st>>>(m_t1, m_in + (size_t)9 * N, W, H, 17);
+    k_clamp01_scale<<<lin, 256, 0, st>>>(m_in + (size_t)9 * N, 1.0f, (int)N);
+
+    // canal 10: GOP. O lado de Python usa o pict_type do stream original
+    // (I=0, P=1, B=2) dividido por 2. Aqui o worker ainda nao propaga
+    // isso ate o filtro, entao vai o valor de P — o mais comum. ISTO E
+    // UMA DIVERGENCIA DECLARADA, nao um esquecimento: o gate do port
+    // roda com o mesmo valor dos dois lados, entao ela nao se esconde
+    // ali; e o dia que o pict_type chegar aqui, este e o unico ponto a
+    // mudar.
+    {
+        k_fill<<<lin, 256, 0, st>>>(m_in + (size_t)10 * N, 0.5f, (int)N);
+    }
+
+    // --- a rede --------------------------------------------------------
+    dim3 gCh((W + 31) / 32, (H + 7) / 8, m_ch);
+    dim3 g1((W + 31) / 32, (H + 7) / 8, 1);
+    k_conv3<<<gCh, blk, 0, st>>>(m_in, m_cin, m_a, m_ch, m_wInp, m_bInp, W, H, 1);
+    for (int b = 0; b < m_bl; ++b)
+    {
+        k_conv3<<<gCh, blk, 0, st>>>(m_a, m_ch, m_b, m_ch, m_w1[b], m_b1[b], W, H, 1);
+        k_conv3<<<gCh, blk, 0, st>>>(m_b, m_ch, m_c, m_ch, m_w2[b], m_b2[b], W, H, 0);
+        k_add<<<(int)((m_ch * N + 255) / 256), 256, 0, st>>>(m_a, m_c, (int)(m_ch * N));
+    }
+    k_conv3<<<g1, blk, 0, st>>>(m_a, m_ch, m_res, 1, m_wOut, m_bOut, W, H, 0);
+
+    // --- composicao: deg + k*residuo, com dither e soma em double ------
+    k_dither<<<grd, blk, 0, st>>>(m_noise, W, H, (unsigned)centro);
+    k_compose<<<grd, blk, 0, st>>>(dCentro, W, m_res, m_noise,
+                                   d_out, outPitch, strength, W, H);
 }
 
 } // namespace cc

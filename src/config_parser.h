@@ -42,6 +42,13 @@ struct PipelineConfig
 
     std::string inputFormatName;
     std::string outputFormatName;
+
+    // CodecClean: filtro de residuo de compressao ANTES do VSR.
+    // NASCE DESLIGADO — sem --cc-blob o worker se comporta exatamente
+    // como antes, bit a bit. O filtro introduz latencia de 3 quadros
+    // (janela de 7 centrada), absorvida pelo drain do processor.
+    std::string ccBlob;              // caminho dos pesos; vazio = desligado
+    float ccStrength = 1.0f;         // k do slider: 0 = bypass exato
     std::string fflags;
 
     bool overwrite = true;

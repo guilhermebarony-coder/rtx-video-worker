@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <memory>
 #include <vector>
@@ -546,7 +547,23 @@ int run_pipeline(PipelineConfig cfg)
         std::unique_ptr<IProcessor> processor;
         if (use_cuda_path)
         {
-            processor = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, outputHDR, inputIsHDR);
+            auto gp = std::make_unique<GpuProcessor>(rtx, cuda_pool, in.vdec->colorspace, outputHDR, inputIsHDR);
+            // CodecClean opera no LUMA na resolucao de ENTRADA, antes do
+            // VSR. Falhar aqui e ERRO, nao aviso: o usuario pediu o
+            // filtro com --cc-blob e seguir sem ele entregaria um video
+            // silenciosamente diferente do pedido.
+            if (!cfg.ccBlob.empty())
+            {
+                if (!gp->enableCodecClean(cfg.ccBlob, cfg.ccStrength,
+                                          in.vdec->width, in.vdec->height))
+                    throw std::runtime_error("CodecClean: falha ao carregar "
+                                             + cfg.ccBlob);
+                LOG_VERBOSE("CodecClean ON: %s, strength %.2f, %dx%d "
+                            "(latencia de 3 quadros)",
+                            cfg.ccBlob.c_str(), cfg.ccStrength,
+                            in.vdec->width, in.vdec->height);
+            }
+            processor = std::move(gp);
         }
         else
         {
@@ -754,14 +771,66 @@ int run_pipeline(PipelineConfig cfg)
 
         // Submit one decoded frame: process -> emit, keyed on the live
         // decoded frame (depth 0 — see the ordering fix above).
+        // FILA DE PROPS DO FILTRO. Com CodecClean ligado o processor
+        // tem latencia de 3 quadros: o quadro que SAI nao e o que acabou
+        // de ENTRAR. Como o emit tira PTS/CFR/side-data do `props`, usar
+        // o decframe atual poria o timestamp do quadro i no quadro i-3 —
+        // erro que nao aparece como erro, so como sincronia estranha.
+        // Entao os props viajam numa fila, na mesma ordem dos quadros.
+        std::deque<FramePtr> cc_props;
+
         auto submit_to_processor = [&](AVFrame *decframe)
         {
             AVFrame *outFrame = nullptr;
             if (!processor->process(decframe, outFrame))
                 throw std::runtime_error("Processor failed to produce output frame");
+
+            if (processor->codecCleanOn())
+            {
+                FramePtr guardado(av_frame_alloc(), &av_frame_free_single);
+                if (!guardado)
+                    throw std::runtime_error("alloc props do filtro");
+                av_frame_copy_props(guardado.get(), decframe);
+                guardado->pts = decframe->pts;
+                guardado->best_effort_timestamp = decframe->best_effort_timestamp;
+                guardado->duration = decframe->duration;
+                cc_props.push_back(std::move(guardado));
+
+                if (!outFrame)
+                    return;                 // ainda enchendo a janela
+                AVFrame *props = cc_props.front().get();
+                processed_frames++;
+                show_progress();
+                emit_processed_output(outFrame, props);
+                cc_props.pop_front();
+                return;
+            }
+
             processed_frames++;
             show_progress();
             emit_processed_output(outFrame, decframe);
+        };
+
+        // DRAIN DO FILTRO: no fim da entrada sobram 3 quadros presos na
+        // janela. Sem isto o video termina 3 quadros mais cedo — e o
+        // arquivo abre, roda e tem quase a duracao certa, que e o que
+        // torna esse bug caro (iter 92/93 deste worker).
+        auto drain_codecclean = [&]()
+        {
+            if (!processor->codecCleanOn())
+                return;
+            processor->filterMarkEnd();
+            AVFrame *outFrame = nullptr;
+            while (processor->filterDrain(outFrame))
+            {
+                if (cc_props.empty())
+                    break;                  // sem props = sem PTS confiavel
+                AVFrame *props = cc_props.front().get();
+                processed_frames++;
+                show_progress();
+                emit_processed_output(outFrame, props);
+                cc_props.pop_front();
+            }
         };
 
         // Shared video-decoder pump        // Shared video-decoder pump — used by the main packet loop and (added in
@@ -1061,6 +1130,11 @@ int run_pipeline(PipelineConfig cfg)
         // all delayed frames through the same pump. Reached only on normal EOF —
         // the duration-limit path gotos straight to done_processing, skipping this.
         pump_video_decoder(nullptr);
+
+        // O decoder ja entregou tudo; agora o FILTRO. A ordem importa:
+        // drenar o filtro antes de esvaziar o decoder deixaria de fora
+        // os quadros que o NVDEC ainda tinha guardados.
+        drain_codecclean();
 
     done_processing:
         // Flush encoder (uses encode_and_write to ensure DTS monotonicity fix is applied)

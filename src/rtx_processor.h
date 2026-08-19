@@ -130,6 +130,11 @@ public:
     // Returns a human-readable description of the last error (if any initialize/process failed)
     const std::string &lastError() const { return m_lastError; }
 
+    // Stream do VSR. Quem enfileira trabalho que o VSR vai LER
+    // tem que usar ESTE stream: ele e cudaStreamNonBlocking e
+    // por isso nao sincroniza com o stream legacy 0.
+    cudaStream_t stream() const { return m_stream; }
+
 private:
     bool initCuda(int gpuIndex);
     void deinitCuda();

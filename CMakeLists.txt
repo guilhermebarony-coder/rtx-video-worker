@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 3.24)
+﻿cmake_minimum_required(VERSION 3.24)
 # Remember whether the USER provided CMAKE_CUDA_ARCHITECTURES: it must be
-# checked before project() — CUDA compiler detection auto-fills it after.
+# checked before project() â€” CUDA compiler detection auto-fills it after.
 if(DEFINED CMAKE_CUDA_ARCHITECTURES OR DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
   set(RTX_USER_CUDA_ARCHS TRUE)
 else()
@@ -41,7 +41,7 @@ find_package(CUDAToolkit REQUIRED)
 
 # Target NVIDIA RTX architectures: 75=Turing(20), 86=Ampere(30), 89=Ada(40),
 # 120=Blackwell(50, e.g. RTX 5080). Only set when the user did not provide
-# CMAKE_CUDA_ARCHITECTURES, and add Blackwell conditionally — arch 120 is
+# CMAKE_CUDA_ARCHITECTURES, and add Blackwell conditionally â€” arch 120 is
 # unknown to nvcc before Toolkit 12.8 and would break RTX 20-40 builds.
 if(NOT RTX_USER_CUDA_ARCHS)
   set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
@@ -169,6 +169,7 @@ add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
 file(GLOB RVP_SOURCES
   src/*.cpp
   src/cuda_kernels.cu
+    src/codecclean.cu
   ${RTX_VIDEO_API_INCLUDE_DIR}/rtx_video_api_cuda_impl.cpp
 )
 file(GLOB RVP_HEADERS
@@ -319,3 +320,4 @@ endif()
 
 # Install
 install(TARGETS RTXVideoProcessor RUNTIME DESTINATION bin)
+
