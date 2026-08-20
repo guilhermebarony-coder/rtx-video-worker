@@ -96,6 +96,40 @@ static bool get_env_bool(const char *name, bool default_value)
     return default_value;
 }
 
+// Le a forca do filtro com VALIDACAO. O que estava aqui era `atof`, que
+// devolve 0.0 para entrada invalida e nao tem como avisar: `--cc-strength
+// abc` e `--cc-strength 0,85` viravam 0.0, o worker anunciava
+// "CodecClean ON" e nao filtrava nada. E `-1` nao desligava o filtro, o
+// INVERTIA — o kernel faz entrada + residuo*255*k, entao k negativo
+// amplifica o artefato em vez de remover.
+//
+// `strtof` com conferencia do ponteiro final pega tudo: lixo, sufixo,
+// virgula decimal (ele para nela e sobra texto), NaN, infinito. A faixa
+// cobrada e a que o --help DECLARA.
+static float parse_cc_strength(const char *txt, const char *flag)
+{
+    char *fim = nullptr;
+    const float v = std::strtof(txt, &fim);
+    if (fim == txt || *fim != '\0')
+    {
+        fprintf(stderr, "%s: valor invalido '%s'.\n", flag, txt);
+        if (std::strchr(txt, ',') != nullptr)
+        {
+            fprintf(stderr, "  Use PONTO como separador decimal: "
+                            "0.85, nao 0,85.\n");
+        }
+        exit(1);
+    }
+    // A forma negada pega NaN junto, que passaria por (v < 0 || v > 1).
+    if (!(v >= 0.0f && v <= 1.0f))
+    {
+        fprintf(stderr, "%s: %g esta fora da faixa 0..1 "
+                        "(0 = bypass exato, 1 = dose cheia).\n", flag, v);
+        exit(1);
+    }
+    return v;
+}
+
 void print_help(const char *argv0)
 {
     fprintf(stderr, "RTXVideoProcessor build %s\n", BUILD_VERSION);
@@ -211,7 +245,8 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
         }
         else if (arg == "--cc-strength")
         {
-            cfg->ccStrength = (float)atof(argv[++i]);
+            cfg->ccStrength =
+                parse_cc_strength(argv[++i], "--cc-strength");
         }
         else if (arg == "-i")
         {
@@ -877,7 +912,8 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
         }
         else if (arg == "--cc-strength")
         {
-            cfg->ccStrength = (float)atof(argv[++i]);
+            cfg->ccStrength =
+                parse_cc_strength(argv[++i], "--cc-strength");
         }
         else if (arg == "--help" || arg == "-h")
         {
