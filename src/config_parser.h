@@ -27,6 +27,9 @@ struct PipelineConfig
     // dither do CodecClean usa; existe para preview de um quadro sair
     // bit-identico ao render.
     long long ccFrameOffset = 0;
+    // Residuo de media zero (--cc-dc-neutral): tira o deslocamento de
+    // brilho do filtro sem encolher a correcao local.
+    bool ccDcNeutral = false;
     // Flag explicita ganha do preset: sem estas duas, `--quality master
     // --nvenc-qp 20` daria 12 e o usuario nao entenderia por que.
     bool qpExplicit = false;

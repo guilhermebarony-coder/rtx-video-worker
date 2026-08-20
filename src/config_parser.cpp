@@ -152,6 +152,7 @@ void print_help(const char *argv0)
     fprintf(stderr, "  --cc-blob <file>      Filter weights. Without it the filter is OFF\n");
     fprintf(stderr, "                        and the worker behaves exactly as before.\n");
     fprintf(stderr, "  --cc-strength <k>     Strength 0..1 (default 1.0). k=0 is EXACT bypass.\n");
+    fprintf(stderr, "  --cc-dc-neutral       Zero-mean residual: keeps the frame's brightness\n                        (the filter darkens by ~1.6 luma without it).\n");
     fprintf(stderr, "                        Adds 3-frame latency (7-frame centered window).\n");
     fprintf(stderr, "  --vsr-quality     Set VSR quality, default 4 (env: RTX_VSR_QUALITY)\n");
     fprintf(stderr, "  --vsr-scale       Output scale factor 1-4, default 2 (env: RTX_VSR_SCALE)\n");
@@ -826,6 +827,10 @@ static void parse_compatibility_mode(int argc, char **argv, PipelineConfig *cfg)
             }
             cfg->rtxCfg.thdrMaxLuminance = std::stoi(argv[++i]);
         }
+        else if (arg == "--cc-dc-neutral")
+        {
+            cfg->ccDcNeutral = true;
+        }
         else if (arg == "--frame-offset")
         {
             if (i + 1 >= argc)
@@ -1090,6 +1095,10 @@ static void parse_simple_mode(int argc, char **argv, PipelineConfig *cfg)
         }
 
         // VSR
+        else if (arg == "--cc-dc-neutral")
+        {
+            cfg->ccDcNeutral = true;
+        }
         else if (arg == "--frame-offset")
         {
             if (i + 1 >= argc)

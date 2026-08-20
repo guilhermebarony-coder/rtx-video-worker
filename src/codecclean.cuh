@@ -49,9 +49,10 @@ bool conv3_launch(const float *src, int cin, float *dst, int cout,
                   const float *hostW = nullptr, const float *hostB = nullptr);
 
 __global__ void k_add(float *x, const float *r, int n);
+__global__ void k_soma_res(const float *res, double *acc, int n);
 __global__ void k_compose(const uint8_t *deg, int pitchIn, const float *res,
                           const float *ruido, uint8_t *out, int pitchOut,
-                          float k, int w, int h);
+                          float k, int w, int h, const double *somaRes);
 
 // ---------------------------------------------------------------------
 // CodecCleanFilter — o filtro inteiro, com a janela de 7 quadros em VRAM.
@@ -102,6 +103,12 @@ public:
     // e o que faz um preview ser bit-identico a entrega.
     void setFrameOffset(long long off) { m_frameOffset = off; }
 
+    // Residuo de media ZERO: o brilho do quadro sai igual ao da entrada
+    // e cada correcao local fica intacta. O filtro ve 9 px e nao tem
+    // como decidir nivel global — o DC dele e efeito colateral. Medido:
+    // sem isto ele empurra 175 mil pixels/quadro contra o piso do preto.
+    void setDcNeutral(bool on) { m_dcNeutral = on; }
+
     int width() const { return m_w; }
     int height() const { return m_h; }
 
@@ -115,6 +122,8 @@ private:
     // Copia dos pesos no HOST: o modo 3 passa peso por parametro de
     // kernel, e o driver copia do lado de ca a cada lancamento.
     float *m_hostW = nullptr;
+    bool m_dcNeutral = false;
+    double *m_dcSoma = nullptr;    // acumulador da media do residuo
     long long m_frameOffset = 0;   // indice absoluto do 1o quadro
     long long m_pushed = 0;   // quantos quadros entraram
     long long m_popped = 0;   // quantos sairam

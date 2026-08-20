@@ -655,17 +655,52 @@ __global__ void k_add(float *__restrict__ x, const float *__restrict__ r, int n)
 // espacamento perto de 235 e ~1,5e-5, entao 235 + 0,99999994 sobe um
 // nivel mesmo com dither correto — e quebra a promessa de BYPASS EXATO
 // em k=0, que e o que faz o slider ser seguro.
+// Soma de clamp(res,-1,1) sobre o quadro, para a media do residuo.
+//
+// EM DOUBLE de proposito: sao 921.600 parcelas de magnitude <= 1, e em
+// float o erro acumulado seria da ordem da propria media que se quer
+// zerar. Reducao em shared por bloco e UM atomicAdd por bloco — 3.600
+// atomicos por quadro, custo desprezivel.
+__global__ void k_soma_res(const float *__restrict__ res, double *acc, int n)
+{
+    extern __shared__ double sh[];
+    const int t = threadIdx.x;
+    double meu = 0.0;
+    for (int i = blockIdx.x * blockDim.x + t; i < n;
+         i += blockDim.x * gridDim.x)
+        meu += (double)clampf(res[i], -1.0f, 1.0f);
+    sh[t] = meu;
+    __syncthreads();
+    for (int passo = blockDim.x / 2; passo > 0; passo >>= 1)
+    {
+        if (t < passo)
+            sh[t] += sh[t + passo];
+        __syncthreads();
+    }
+    if (t == 0)
+        atomicAdd(acc, sh[0]);
+}
+
 __global__ void k_compose(const uint8_t *__restrict__ deg, int pitchIn,
                           const float *__restrict__ res,
                           const float *__restrict__ ruido,
                           uint8_t *__restrict__ out, int pitchOut,
-                          float k, int w, int h)
+                          float k, int w, int h,
+                          const double *__restrict__ somaRes)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
         return;
-    float r = clampf(res[y * w + x], -1.0f, 1.0f) * 255.0f * k;
+    // DC do residuo, quando pedido: o filtro ve 9 px e nao tem como
+    // decidir o nivel global do quadro, entao a media que ele produz e
+    // efeito colateral. Subtraindo-a, o brilho sai igual ao da entrada e
+    // cada correcao local fica intacta. Sem isto o filtro empurrava
+    // 175 mil pixels por quadro contra o piso do preto, onde a
+    // informacao nao volta.
+    const double dc = somaRes ? (*somaRes) / ((double)w * h) : 0.0;
+    float r = (float)((double)clampf(res[y * w + x], -1.0f, 1.0f) - dc)
+              * 255.0f * k;
     double v = (double)deg[y * pitchIn + x] + (double)r;
     if (v < 0.0)
         v = 0.0;
@@ -773,6 +808,7 @@ bool CodecCleanFilter::init(const char *blobPath, int w, int h, cudaStream_t str
     ok &= cudaMalloc(&m_b, (size_t)m_ch * N * 4) == cudaSuccess;
     for (float **p : {&m_f, &m_f2, &m_t1, &m_t2, &m_acc, &m_soma, &m_res, &m_noise})
         ok &= cudaMalloc(p, N * 4) == cudaSuccess;
+    ok &= cudaMalloc(&m_dcSoma, sizeof(double)) == cudaSuccess;
     if (!ok) { free(hostW); destroy(); return false; }
 
     cudaMemcpy(m_w8, hostW, nW * 4, cudaMemcpyHostToDevice);
@@ -802,6 +838,7 @@ void CodecCleanFilter::destroy()
     if (s_donoDaConstante == this)
         s_donoDaConstante = nullptr;
     if (m_hostW) { free(m_hostW); m_hostW = nullptr; }
+    if (m_dcSoma) { cudaFree(m_dcSoma); m_dcSoma = nullptr; }
     for (void *p : {(void *)m_w8, (void *)m_ring, (void *)m_ringUV,
                     (void *)m_in, (void *)m_a,
                     (void *)m_b, (void *)m_f, (void *)m_f2,
@@ -969,8 +1006,20 @@ void CodecCleanFilter::runNetwork(int centro, float strength,
     // ruido que o render inteiro geraria naquele quadro.
     k_dither<<<grd, blk, 0, st>>>(m_noise, W, H,
                                   (unsigned)(centro + m_frameOffset));
+    // Media do residuo, so quando o modo esta ligado: sem ele nao ha
+    // reducao nenhuma e o caminho fica identico ao de antes.
+    const double *somaRes = nullptr;
+    if (m_dcNeutral)
+    {
+        cudaMemsetAsync(m_dcSoma, 0, sizeof(double), st);
+        const int blocos = 256;
+        k_soma_res<<<blocos, 256, 256 * sizeof(double), st>>>(
+            m_res, m_dcSoma, (int)N);
+        somaRes = m_dcSoma;
+    }
     k_compose<<<grd, blk, 0, st>>>(dCentro, W, m_res, m_noise,
-                                   d_out, outPitch, strength, W, H);
+                                   d_out, outPitch, strength, W, H,
+                                   somaRes);
 }
 
 } // namespace cc
